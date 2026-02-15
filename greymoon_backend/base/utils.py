@@ -3,13 +3,41 @@ from .models import ServiceLead
 from django.utils.dateparse import parse_datetime
 
 KEYWORDS = [
+    # Cleaning
     "cleaning",
+    "deep clean",
+    "house cleaning",
+    "office cleaning",
+    "pressure washing",
+    "window cleaning",
+
+    # Maintenance
     "maintenance",
+    "repair",
+    "plumber",
+    "plumbing",
+    "painter",
+    "painting",
+    "electrical",
+    "electrician",
+    "hvac",
+    "air conditioning",
+    "roof repair",
+    "handyman",
+    "carpentry",
+
+    # Waste management
+    "junk removal",
     "junk",
     "waste",
     "trash",
-    "repair"
+    "garbage",
+    "hauling",
+    "dumpster",
+    "septic",
+    "drain cleaning"
 ]
+
 
 def valid_service(title, description):
     text = (title + " " + description).lower()
@@ -32,19 +60,26 @@ def extract_email(text):
 
 def process_results(results):
     print("Processing results count:", len(results))
+
     for item in results:
-        print("Saving:", item.get("id"), item.get("title"))
+        title = item.get("title", "")
+        description = item.get("post", "")
+
+        # FILTER HERE
+        if not valid_service(title, description):
+            continue
+
         try:
             phone_numbers = item.get("phoneNumbers", [])
             phone = phone_numbers[0] if phone_numbers else None
-            email = extract_email(item.get("post", ""))
-            zip_code = extract_zip(item.get("post", ""))
+            email = extract_email(description)
+            zip_code = extract_zip(description)
 
             ServiceLead.objects.update_or_create(
                 post_id=item.get("id"),
                 defaults={
                     "url": item.get("url"),
-                    "title": item.get("title"),
+                    "title": title,
                     "datetime": item.get("datetime"),
                     "location": item.get("location"),
                     "category": item.get("category"),
@@ -52,7 +87,7 @@ def process_results(results):
                     "longitude": item.get("longitude"),
                     "latitude": item.get("latitude"),
                     "map_accuracy": item.get("mapAccuracy"),
-                    "post": item.get("post"),
+                    "post": description,
                     "phone": phone,
                     "email": email,
                     "zip_code": zip_code,
@@ -61,5 +96,4 @@ def process_results(results):
             )
         except Exception as e:
             print("Error saving item:", e)
-
 

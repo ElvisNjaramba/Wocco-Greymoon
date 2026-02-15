@@ -15,7 +15,7 @@ US_CITIES = [
     "atlanta"
 ]
 
-CATEGORIES = ["hss", "lss"]
+CATEGORIES = ["hss", "skd"]
 
 def build_urls_payload():
     urls = []
