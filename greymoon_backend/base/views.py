@@ -1,6 +1,6 @@
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
-from .services.apify_service import run_actor
+from .services.apify_service import US_CITIES, run_actor
 from .models import ServiceLead
 from .serializers import ServiceLeadSerializer
 
@@ -13,10 +13,43 @@ from .models import ScrapeRun
 import requests
 from django.conf import settings
 
+# @api_view(["POST"])
+# @permission_classes([IsAuthenticated])
+# def manual_scrape(request):
+#     run_id, dataset_id = run_actor()
+
+#     scrape_run = ScrapeRun.objects.create(
+#         run_id=run_id,
+#         status="RUNNING"
+#     )
+
+#     start_scrape_thread(run_id, dataset_id)
+
+#     return Response({
+#         "message": "Scraping started",
+#         "run_id": run_id
+#     })
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def manual_scrape(request):
-    run_id, dataset_id = run_actor()
+    selected_cities = request.data.get("cities", [])
+
+    if not selected_cities:
+        return Response(
+            {"error": "At least one city must be selected"},
+            status=400
+        )
+
+    # Validate cities (security layer)
+    invalid = [c for c in selected_cities if c not in US_CITIES]
+    if invalid:
+        return Response(
+            {"error": f"Invalid cities: {invalid}"},
+            status=400
+        )
+
+    run_id, dataset_id = run_actor(selected_cities)
 
     scrape_run = ScrapeRun.objects.create(
         run_id=run_id,
@@ -29,6 +62,7 @@ def manual_scrape(request):
         "message": "Scraping started",
         "run_id": run_id
     })
+
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
@@ -69,3 +103,43 @@ def list_services(request):
     leads = ServiceLead.objects.all().order_by("-created_at")[:500]
     serializer = ServiceLeadSerializer(leads, many=True)
     return Response(serializer.data)
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def update_lead_status(request, post_id):
+    try:
+        lead = ServiceLead.objects.get(post_id=post_id)
+    except ServiceLead.DoesNotExist:
+        return Response({"error": "Lead not found"}, status=404)
+
+    new_status = request.data.get("status")
+
+    if new_status not in dict(ServiceLead.STATUS_CHOICES):
+        return Response({"error": "Invalid status"}, status=400)
+
+    lead.status = new_status
+    lead.save()
+
+    return Response({"message": "Status updated"})
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def scrape_history(request):
+    runs = ScrapeRun.objects.order_by("-created_at")
+    data = []
+
+    for run in runs:
+        data.append({
+            "run_id": run.run_id,
+            "status": run.status,
+            "leads_collected": run.leads_collected,
+            "started_at": run.created_at,
+            "finished_at": run.finished_at,
+        })
+
+    return Response(data)
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def get_cities(request):
+    return Response({"cities": US_CITIES})
