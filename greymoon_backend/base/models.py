@@ -16,11 +16,11 @@ class ServiceLead(models.Model):
     location = models.CharField(max_length=255, null=True, blank=True)
     category = models.CharField(max_length=255, null=True, blank=True)
     label = models.CharField(max_length=100, null=True, blank=True)
-
+    state = models.CharField(max_length=100, null=True, blank=True)
     longitude = models.CharField(max_length=50, null=True, blank=True)
     latitude = models.CharField(max_length=50, null=True, blank=True)
     map_accuracy = models.CharField(max_length=50, null=True, blank=True)
-
+    content_hash = models.CharField(max_length=64, null=True, blank=True, db_index=True)
     post = models.TextField(null=True, blank=True)
 
     phone = models.CharField(max_length=50, null=True, blank=True)
@@ -44,6 +44,7 @@ class ServiceLead(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=["post_id"]),
+            models.Index(fields=["content_hash"]),
             models.Index(fields=["created_at"]),
         ]
 

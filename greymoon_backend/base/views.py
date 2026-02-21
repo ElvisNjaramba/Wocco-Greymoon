@@ -139,7 +139,22 @@ def scrape_history(request):
 
     return Response(data)
 
+# @api_view(["GET"])
+# @permission_classes([IsAuthenticated])
+# def get_cities(request):
+#     return Response({"cities": US_CITIES})
+
+from .services.city_structure import US_CITY_STRUCTURE
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_cities(request):
-    return Response({"cities": US_CITIES})
+    cities_data = []
+    for state_code, state_info in US_CITY_STRUCTURE.items():
+        for region in state_info["regions"]:
+            cities_data.append({
+                "code": region["code"],
+                "name": region["name"],
+                "state": state_code,
+                "display": f"{region['name']}, {state_code}"
+            })
+    return Response({"cities": cities_data})

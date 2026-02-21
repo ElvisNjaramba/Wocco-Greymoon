@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useContext, useMemo } from "react";
 import axios from "axios";
 import { AuthContext } from "../context/AuthContext";
-import { MapContainer, TileLayer, Marker, Popup } from "react-leaflet";
+import { MapContainer, TileLayer, Marker, Popup, Tooltip } from "react-leaflet";
 import { Phone, Mail, MapPin, Calendar, Star, X, RefreshCw, Download, Filter, Eye, CheckSquare, Square, ChevronDown } from 'lucide-react';
 
 const Services = () => {
@@ -21,12 +21,22 @@ const Services = () => {
   const [loadingCities, setLoadingCities] = useState(false);
   const [isAborting, setIsAborting] = useState(false);
 
+  // Filter states
+  const [filterCategory, setFilterCategory] = useState("");
+  const [filterHasPhone, setFilterHasPhone] = useState(false);
+  const [filterHasEmail, setFilterHasEmail] = useState(false);
+  const [filterState, setFilterState] = useState("");
+  const [filterStatus, setFilterStatus] = useState("");
+  const [filterMinScore, setFilterMinScore] = useState("");
+  const [filterMaxScore, setFilterMaxScore] = useState("");
+
   // Pagination
   const [currentPage, setCurrentPage] = useState(1);
   const leadsPerPage = 20;
 
   const token = localStorage.getItem("access");
 
+  // Fetch all leads
   const fetchServices = async () => {
     setLoading(true);
     try {
@@ -34,7 +44,6 @@ const Services = () => {
         "http://127.0.0.1:8000/api/services/",
         { headers: { Authorization: `Bearer ${token}` } }
       );
-
       setServices(response.data);
       setFiltered(response.data);
       setLeadCount(response.data.length);
@@ -44,6 +53,7 @@ const Services = () => {
     setLoading(false);
   };
 
+  // Fetch cities with structure
   const fetchCities = async () => {
     setLoadingCities(true);
     try {
@@ -51,7 +61,7 @@ const Services = () => {
         "http://127.0.0.1:8000/api/cities/",
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      setAvailableCities(response.data.cities || []);
+      setAvailableCities(response.data.cities); // array of {code, name, state, display}
     } catch (err) {
       console.error("Error fetching cities:", err);
     } finally {
@@ -59,32 +69,41 @@ const Services = () => {
     }
   };
 
+  // Group cities by state for dropdown
+  const citiesByState = useMemo(() => {
+    return availableCities.reduce((acc, city) => {
+      const state = city.state || 'Other';
+      if (!acc[state]) acc[state] = [];
+      acc[state].push(city);
+      return acc;
+    }, {});
+  }, [availableCities]);
+
+  // Scraper status
   const checkStatus = async () => {
     try {
       const res = await axios.get(
         "http://127.0.0.1:8000/api/scrape-status/",
         { headers: { Authorization: `Bearer ${token}` } }
       );
-
       if (res.data.status === "RUNNING") {
         setScraping(true);
       } else {
         setScraping(false);
-        setIsAborting(false); // 🔥 reset abort state when done
+        setIsAborting(false);
       }
-
       setRunId(res.data.run_id);
     } catch (err) {
       console.error("Status check failed");
     }
   };
 
+  // Start scraping
   const triggerScrape = async () => {
     if (selectedCities.length === 0) {
       alert("Please select at least one city.");
       return;
     }
-
     setScraping(true);
     try {
       const res = await axios.post(
@@ -99,42 +118,66 @@ const Services = () => {
     }
   };
 
+  // Cancel scraping
   const cancelScrape = async () => {
     if (!runId) return;
-
     try {
-      setIsAborting(true); // 🔥 show aborting state
-
+      setIsAborting(true);
       await axios.post(
         "http://127.0.0.1:8000/api/cancel-scrape/",
         { run_id: runId },
         { headers: { Authorization: `Bearer ${token}` } }
       );
-
-      // Don't immediately stop scraping visually.
-      // Wait for backend status polling to update it.
     } catch (err) {
       console.error("Cancel failed");
       setIsAborting(false);
     }
   };
 
-
-  // FILTER HANDLER
-  const handleFilter = (filters) => {
-    const { category, hasPhone, hasEmail } = filters;
+  // Enhanced filter handler
+  const applyFilters = () => {
     let temp = [...services];
 
-    if (category) {
-      temp = temp.filter((s) => s.category === category);
+    if (filterCategory) {
+      temp = temp.filter((s) => s.category === filterCategory);
     }
-    if (hasPhone) temp = temp.filter((s) => s.phone);
-    if (hasEmail) temp = temp.filter((s) => s.email);
+    if (filterHasPhone) {
+      temp = temp.filter((s) => s.phone);
+    }
+    if (filterHasEmail) {
+      temp = temp.filter((s) => s.email);
+    }
+    if (filterState) {
+      temp = temp.filter((s) => s.state === filterState);
+    }
+    if (filterStatus) {
+      temp = temp.filter((s) => s.status === filterStatus);
+    }
+    if (filterMinScore) {
+      temp = temp.filter((s) => s.score >= parseInt(filterMinScore, 10));
+    }
+    if (filterMaxScore) {
+      temp = temp.filter((s) => s.score <= parseInt(filterMaxScore, 10));
+    }
 
     setFiltered(temp);
     setCurrentPage(1);
   };
 
+  // Reset filters
+  const resetFilters = () => {
+    setFilterCategory("");
+    setFilterHasPhone(false);
+    setFilterHasEmail(false);
+    setFilterState("");
+    setFilterStatus("");
+    setFilterMinScore("");
+    setFilterMaxScore("");
+    setFiltered(services);
+    setCurrentPage(1);
+  };
+
+  // Fetch history
   const fetchHistory = async () => {
     try {
       const res = await axios.get(
@@ -162,25 +205,22 @@ const Services = () => {
     };
   }, [services]);
 
-  // PAGINATION
+  // Pagination
   const indexOfLastLead = currentPage * leadsPerPage;
   const indexOfFirstLead = indexOfLastLead - leadsPerPage;
   const currentLeads = filtered.slice(indexOfFirstLead, indexOfLastLead);
   const totalPages = Math.ceil(filtered.length / leadsPerPage);
-
   const paginate = (pageNum) => setCurrentPage(pageNum);
 
   const mapLeads = filtered.filter((s) => s.latitude && s.longitude);
 
-  // History Pagination
+  // History pagination
   const [historyPage, setHistoryPage] = useState(1);
   const historyPerPage = 10;
-
   const indexOfLastHistory = historyPage * historyPerPage;
   const indexOfFirstHistory = indexOfLastHistory - historyPerPage;
   const currentHistory = history.slice(indexOfFirstHistory, indexOfLastHistory);
   const totalHistoryPages = Math.ceil(history.length / historyPerPage);
-
   const paginateHistory = (pageNum) => setHistoryPage(pageNum);
 
   useEffect(() => {
@@ -199,14 +239,18 @@ const Services = () => {
     return () => clearInterval(interval);
   }, [scraping]);
 
-  // Get score color
+  // Apply filters whenever any filter changes
+  useEffect(() => {
+    applyFilters();
+  }, [filterCategory, filterHasPhone, filterHasEmail, filterState, filterStatus, filterMinScore, filterMaxScore, services]);
+
+  // Color helpers
   const getScoreColor = (score) => {
     if (score >= 70) return 'bg-gradient-to-r from-green-400 to-green-500';
     if (score >= 40) return 'bg-gradient-to-r from-yellow-400 to-yellow-500';
     return 'bg-gradient-to-r from-gray-400 to-gray-500';
   };
 
-  // Get status color
   const getStatusColor = (status) => {
     const colors = {
       'NEW': 'bg-blue-100 text-blue-800 border-blue-200',
@@ -218,33 +262,41 @@ const Services = () => {
     return colors[status] || 'bg-gray-100 text-gray-800 border-gray-200';
   };
 
-  const toggleCity = (city) => {
+  // City selection helpers
+  const toggleCity = (cityCode) => {
     setSelectedCities(prev =>
-      prev.includes(city)
-        ? prev.filter(c => c !== city)
-        : [...prev, city]
+      prev.includes(cityCode)
+        ? prev.filter(c => c !== cityCode)
+        : [...prev, cityCode]
     );
   };
 
   const selectAllCities = () => {
-    setSelectedCities([...availableCities]);
+    setSelectedCities(availableCities.map(c => c.code));
   };
 
   const clearAllCities = () => {
     setSelectedCities([]);
   };
 
-  // Format city name for display (capitalize, replace underscores)
-  const formatCityName = (city) => {
-    return city
-      .split('_')
-      .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-      .join(' ');
+  const formatCityName = (cityCode) => {
+    const cityObj = availableCities.find(c => c.code === cityCode);
+    return cityObj ? cityObj.display : cityCode;
   };
+
+  // Get unique states from services for filter dropdown
+  const uniqueStates = useMemo(() => {
+    return [...new Set(services.map(s => s.state).filter(Boolean))].sort();
+  }, [services]);
+
+  // Get unique statuses from services
+  const uniqueStatuses = useMemo(() => {
+    return [...new Set(services.map(s => s.status))];
+  }, [services]);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100">
-      {/* Header with glass morphism effect */}
+      {/* Header (unchanged) */}
       <div className="bg-white/80 backdrop-blur-md shadow-lg sticky top-0 z-40 border-b border-gray-200">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
           <div className="flex justify-between items-center">
@@ -276,7 +328,7 @@ const Services = () => {
       </div>
 
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {/* Stats Cards with gradients */}
+        {/* Stats Cards (unchanged) */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
           {[
             { label: 'Total Leads', value: leadCount, color: 'from-blue-500 to-blue-600', icon: RefreshCw },
@@ -296,26 +348,21 @@ const Services = () => {
           ))}
         </div>
 
-        {/* Scrape Controls Card */}
+        {/* Scrape Controls Card (unchanged) */}
         <div className="bg-white rounded-xl shadow-lg mb-8 relative">
-
           <div className="bg-gradient-to-r from-gray-50 to-gray-100 px-6 py-4 border-b border-gray-200">
             <h2 className="text-lg font-semibold text-gray-800 flex items-center">
               <RefreshCw className="w-5 h-5 mr-2 text-blue-600" />
               Scrape Controls
             </h2>
           </div>
-
           <div className="p-6">
-
-            {/* City Selection - Enhanced Dropdown */}
+            {/* City Selection (unchanged) */}
             <div className="mb-6">
               <label className="block text-sm font-medium text-gray-700 mb-2">
                 Select Cities to Scrape
               </label>
-
               <div className="relative">
-                {/* Dropdown Trigger */}
                 <button
                   type="button"
                   onClick={() => setIsCityDropdownOpen(!isCityDropdownOpen)}
@@ -342,7 +389,6 @@ const Services = () => {
                   <ChevronDown className={`w-5 h-5 text-gray-400 transition-transform duration-200 ${isCityDropdownOpen ? 'transform rotate-180' : ''}`} />
                 </button>
 
-                {/* Dropdown Menu - IMPROVED VISIBILITY */}
                 {isCityDropdownOpen && !loadingCities && (
                   <div className="absolute left-0 right-0 z-50 mt-1 bg-white border-2 border-blue-200 rounded-lg shadow-2xl max-h-[500px] overflow-y-auto">
                     <div className="sticky top-0 bg-gradient-to-r from-blue-50 to-blue-100 px-4 py-3 border-b-2 border-blue-200 flex justify-between items-center">
@@ -350,40 +396,41 @@ const Services = () => {
                         {availableCities.length} CITIES AVAILABLE
                       </span>
                       <div className="space-x-3">
-                        <button
-                          onClick={selectAllCities}
-                          className="text-xs bg-blue-600 text-white px-3 py-1.5 rounded-md hover:bg-blue-700 font-medium shadow-sm"
-                        >
+                        <button onClick={selectAllCities} className="text-xs bg-blue-600 text-white px-3 py-1.5 rounded-md hover:bg-blue-700 font-medium shadow-sm">
                           Select All
                         </button>
-                        <button
-                          onClick={clearAllCities}
-                          className="text-xs bg-gray-600 text-white px-3 py-1.5 rounded-md hover:bg-gray-700 font-medium shadow-sm"
-                        >
+                        <button onClick={clearAllCities} className="text-xs bg-gray-600 text-white px-3 py-1.5 rounded-md hover:bg-gray-700 font-medium shadow-sm">
                           Clear
                         </button>
                       </div>
                     </div>
-                    <div className="p-4 bg-white grid grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-x-6 gap-y-3">
-
-
-                      {availableCities.map((city) => (
-                        <label
-                          key={city}
-                          className="flex items-center space-x-3 px-3 py-2.5 hover:bg-blue-50 rounded-lg cursor-pointer transition-colors border border-transparent hover:border-blue-200"
-                        >
-                          <input
-                            type="checkbox"
-                            checked={selectedCities.includes(city)}
-                            onChange={() => toggleCity(city)}
-                            className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
-                          />
-                          <span className="text-gray-800 font-medium">{formatCityName(city)}</span>
-                        </label>
-                      ))}
+                    <div className="p-4 bg-white">
+                      {Object.entries(citiesByState)
+                        .sort(([stateA], [stateB]) => stateA.localeCompare(stateB))
+                        .map(([state, cities]) => (
+                          <div key={state} className="mb-6">
+                            <h4 className="font-bold text-gray-700 mb-2 px-2 border-b border-gray-200 pb-1">
+                              {state}
+                            </h4>
+                            <div className="grid grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-x-6 gap-y-3">
+                              {cities.map((cityObj) => (
+                                <label
+                                  key={cityObj.code}
+                                  className="flex items-center space-x-3 px-3 py-2.5 hover:bg-blue-50 rounded-lg cursor-pointer transition-colors border border-transparent hover:border-blue-200"
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={selectedCities.includes(cityObj.code)}
+                                    onChange={() => toggleCity(cityObj.code)}
+                                    className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
+                                  />
+                                  <span className="text-gray-800 font-medium">{cityObj.display}</span>
+                                </label>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
                     </div>
-
-                    {/* City count footer */}
                     <div className="sticky bottom-0 bg-gray-50 px-4 py-2 border-t-2 border-gray-200 text-xs text-gray-600 text-center">
                       Showing {availableCities.length} cities • Select multiple cities to scrape
                     </div>
@@ -391,28 +438,31 @@ const Services = () => {
                 )}
               </div>
 
-              {/* Selected Cities Chips */}
+              {/* Selected cities chips */}
               {selectedCities.length > 0 && (
                 <div className="mt-3 flex flex-wrap gap-2 max-h-32 overflow-y-auto p-2 bg-gray-50 rounded-lg border border-gray-200">
-                  {selectedCities.map((city) => (
-                    <span
-                      key={city}
-                      className="inline-flex items-center bg-blue-100 text-blue-800 px-3 py-1.5 rounded-full text-sm font-medium border border-blue-300 shadow-sm"
-                    >
-                      <span>{formatCityName(city)}</span>
-                      <button
-                        onClick={() => toggleCity(city)}
-                        className="ml-2 text-blue-600 hover:text-blue-800 hover:bg-blue-200 rounded-full p-0.5"
+                  {selectedCities.map((code) => {
+                    const cityObj = availableCities.find(c => c.code === code);
+                    return (
+                      <span
+                        key={code}
+                        className="inline-flex items-center bg-blue-100 text-blue-800 px-3 py-1.5 rounded-full text-sm font-medium border border-blue-300 shadow-sm"
                       >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    </span>
-                  ))}
+                        <span>{cityObj ? cityObj.display : formatCityName(code)}</span>
+                        <button
+                          onClick={() => toggleCity(code)}
+                          className="ml-2 text-blue-600 hover:text-blue-800 hover:bg-blue-200 rounded-full p-0.5"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </span>
+                    );
+                  })}
                 </div>
               )}
             </div>
 
-            {/* Scrape Buttons */}
+            {/* Scrape Buttons (unchanged) */}
             <div className="flex items-center justify-between flex-wrap gap-4">
               <div>
                 {!scraping ? (
@@ -432,17 +482,14 @@ const Services = () => {
                       <span className="text-yellow-700 font-medium">
                         {isAborting ? "Aborting scrape..." : "Scraping in progress..."}
                       </span>
-
                     </div>
                     <button
                       onClick={cancelScrape}
                       disabled={isAborting}
-                      className={`bg-gradient-to-r from-red-500 to-red-600 text-white px-4 py-2 rounded-lg font-semibold transition-all duration-200 shadow-md hover:shadow-lg ${isAborting ? "opacity-50 cursor-not-allowed" : ""
-                        }`}
+                      className={`bg-gradient-to-r from-red-500 to-red-600 text-white px-4 py-2 rounded-lg font-semibold transition-all duration-200 shadow-md hover:shadow-lg ${isAborting ? "opacity-50 cursor-not-allowed" : ""}`}
                     >
                       {isAborting ? "Aborting..." : "Cancel Scrape"}
                     </button>
-
                   </div>
                 )}
               </div>
@@ -456,74 +503,140 @@ const Services = () => {
           </div>
         </div>
 
-        {/* Filters and Status Section */}
-        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 mb-8">
-          {/* Filters Card */}
-          <div className="bg-white rounded-xl shadow-lg overflow-hidden lg:col-span-1">
-            <div className="bg-gradient-to-r from-gray-50 to-gray-100 px-4 py-3 border-b border-gray-200">
-              <h3 className="font-semibold text-gray-800 flex items-center">
-                <Filter className="w-4 h-4 mr-2 text-blue-600" />
-                Filters
-              </h3>
+        {/* ========== COMPACT STATUS PILLS + FILTERS ========== */}
+        {/* Status pills - minimal space */}
+        <div className="flex flex-wrap gap-2 mb-4">
+          {[
+            { status: 'NEW', color: 'blue', count: statusCounts.NEW },
+            { status: 'CONTACTED', color: 'yellow', count: statusCounts.CONTACTED },
+            { status: 'QUALIFIED', color: 'green', count: statusCounts.QUALIFIED },
+            { status: 'WON', color: 'purple', count: statusCounts.WON },
+            { status: 'LOST', color: 'red', count: statusCounts.LOST },
+          ].map(({ status, color, count }) => (
+            <div
+              key={status}
+              className={`inline-flex items-center bg-${color}-50 text-${color}-700 px-3 py-1 rounded-full text-sm font-medium border border-${color}-200`}
+            >
+              <span>{status}</span>
+              <span className={`ml-2 bg-${color}-200 text-${color}-800 px-2 py-0.5 rounded-full text-xs font-bold`}>
+                {count}
+              </span>
             </div>
-            <div className="p-4 space-y-4">
+          ))}
+        </div>
+
+        {/* Filters Card - Full width */}
+        <div className="bg-white rounded-xl shadow-lg overflow-hidden mb-8">
+          <div className="bg-gradient-to-r from-gray-50 to-gray-100 px-4 py-3 border-b border-gray-200 flex justify-between items-center">
+            <h3 className="font-semibold text-gray-800 flex items-center">
+              <Filter className="w-4 h-4 mr-2 text-blue-600" />
+              Filters
+            </h3>
+            <button
+              onClick={resetFilters}
+              className="text-xs text-blue-600 hover:text-blue-800 font-medium"
+            >
+              Reset
+            </button>
+          </div>
+          <div className="p-4 space-y-4">
+            {/* Category */}
+            <div>
+              <label className="block text-xs font-medium text-gray-600 mb-1">Category</label>
               <select
-                onChange={(e) => handleFilter({ category: e.target.value || null })}
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                value={filterCategory}
+                onChange={(e) => setFilterCategory(e.target.value)}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               >
                 <option value="">All Categories</option>
                 {[...new Set(services.map((s) => s.category))].map((c) => (
-                  <option key={c} value={c}>
-                    {c}
-                  </option>
+                  <option key={c} value={c}>{c}</option>
                 ))}
               </select>
+            </div>
 
+            {/* State */}
+            <div>
+              <label className="block text-xs font-medium text-gray-600 mb-1">State</label>
+              <select
+                value={filterState}
+                onChange={(e) => setFilterState(e.target.value)}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              >
+                <option value="">All States</option>
+                {uniqueStates.map(state => (
+                  <option key={state} value={state}>{state}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Status */}
+            <div>
+              <label className="block text-xs font-medium text-gray-600 mb-1">Status</label>
+              <select
+                value={filterStatus}
+                onChange={(e) => setFilterStatus(e.target.value)}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              >
+                <option value="">All Statuses</option>
+                {uniqueStatuses.map(status => (
+                  <option key={status} value={status}>{status}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Score Range */}
+            <div>
+              <label className="block text-xs font-medium text-gray-600 mb-1">Score Range</label>
+              <div className="flex items-center space-x-2">
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  placeholder="Min"
+                  value={filterMinScore}
+                  onChange={(e) => setFilterMinScore(e.target.value)}
+                  className="w-1/2 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                />
+                <span className="text-gray-500">-</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  placeholder="Max"
+                  value={filterMaxScore}
+                  onChange={(e) => setFilterMaxScore(e.target.value)}
+                  className="w-1/2 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                />
+              </div>
+            </div>
+
+            {/* Checkboxes */}
+            <div className="space-y-2 pt-2">
               <label className="flex items-center space-x-3 cursor-pointer p-2 hover:bg-gray-50 rounded-lg transition-colors">
                 <input
                   type="checkbox"
-                  onChange={(e) => handleFilter({ hasPhone: e.target.checked })}
+                  checked={filterHasPhone}
+                  onChange={(e) => setFilterHasPhone(e.target.checked)}
                   className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
                 />
-                <span className="text-gray-700">Has Phone</span>
+                <span className="text-gray-700 text-sm">Has Phone</span>
               </label>
 
               <label className="flex items-center space-x-3 cursor-pointer p-2 hover:bg-gray-50 rounded-lg transition-colors">
                 <input
                   type="checkbox"
-                  onChange={(e) => handleFilter({ hasEmail: e.target.checked })}
+                  checked={filterHasEmail}
+                  onChange={(e) => setFilterHasEmail(e.target.checked)}
                   className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
                 />
-                <span className="text-gray-700">Has Email</span>
+                <span className="text-gray-700 text-sm">Has Email</span>
               </label>
             </div>
           </div>
-
-          {/* Status Cards */}
-          <div className="lg:col-span-3 grid grid-cols-2 md:grid-cols-5 gap-3">
-            {[
-              { status: "NEW", color: "blue" },
-              { status: "CONTACTED", color: "yellow" },
-              { status: "QUALIFIED", color: "green" },
-              { status: "WON", color: "purple" },
-              { status: "LOST", color: "red" },
-            ].map(({ status, color }) => (
-              <div
-                key={status}
-                className={`bg-white rounded-xl shadow-lg overflow-hidden border-l-4 border-${color}-500 hover:shadow-xl transition-shadow`}
-              >
-                <div className="p-4">
-                  <p className="text-xs text-gray-600 uppercase tracking-wider">{status}</p>
-                  <p className={`text-2xl font-bold text-${color}-600`}>
-                    {statusCounts[status]}
-                  </p>
-                </div>
-              </div>
-            ))}
-          </div>
         </div>
 
-        {/* Leads Table */}
+        {/* Leads Table (unchanged) */}
         <div className="bg-white rounded-xl shadow-lg mb-8 overflow-hidden">
           <div className="bg-gradient-to-r from-gray-50 to-gray-100 px-6 py-4 border-b border-gray-200 flex justify-between items-center">
             <h2 className="text-lg font-semibold text-gray-800">Leads</h2>
@@ -545,7 +658,8 @@ const Services = () => {
                     <tr>
                       <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Title</th>
                       <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Category</th>
-                      <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Location</th>
+                      <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">State</th>
+                      <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Zip</th>
                       <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Contact</th>
                       <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Status</th>
                       <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Score</th>
@@ -564,12 +678,8 @@ const Services = () => {
                             {s.category}
                           </span>
                         </td>
-                        <td className="px-6 py-4 text-sm text-gray-600">
-                          <div className="flex items-center">
-                            <MapPin className="w-4 h-4 mr-1 text-gray-400" />
-                            {s.location || 'N/A'}
-                          </div>
-                        </td>
+                        <td className="px-6 py-4 text-sm text-gray-600">{s.state || 'N/A'}</td>
+                        <td className="px-6 py-4 text-sm text-gray-600">{s.zip_code || 'N/A'}</td>
                         <td className="px-6 py-4">
                           <div className="flex space-x-2">
                             {s.phone && <Phone className="w-4 h-4 text-green-600" />}
@@ -645,7 +755,7 @@ const Services = () => {
           )}
         </div>
 
-        {/* Scrape History */}
+        {/* Scrape History (unchanged) */}
         <div className="bg-white rounded-xl shadow-lg mb-8 overflow-hidden">
           <div className="bg-gradient-to-r from-gray-50 to-gray-100 px-6 py-4 border-b border-gray-200">
             <h2 className="text-lg font-semibold text-gray-800">Scrape History</h2>
@@ -706,7 +816,7 @@ const Services = () => {
           </div>
         </div>
 
-        {/* Map */}
+        {/* Map (unchanged) */}
         <div className="bg-white rounded-xl shadow-lg overflow-hidden">
           <div className="bg-gradient-to-r from-gray-50 to-gray-100 px-6 py-4 border-b border-gray-200">
             <h2 className="text-lg font-semibold text-gray-800 flex items-center">
@@ -718,53 +828,42 @@ const Services = () => {
             <MapContainer
               center={[37.8, -96]}
               zoom={4}
-              minZoom={4}                         // prevent zooming out
+              minZoom={4}
               maxZoom={10}
               scrollWheelZoom={true}
               style={{ height: "500px", width: "100%", borderRadius: "0.5rem" }}
               maxBounds={usaBounds}
-              maxBoundsViscosity={1.0}            // hard lock to bounds
+              maxBoundsViscosity={1.0}
               whenCreated={(map) => {
                 map.setMaxBounds(usaBounds);
                 map.fitBounds(usaBounds);
               }}
             >
-
               <TileLayer
                 attribution='&copy; OpenStreetMap contributors'
                 url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
               />
-
-              {mapLeads.map((lead) => (
-                <Marker
-                  key={lead.post_id}
-                  position={[parseFloat(lead.latitude), parseFloat(lead.longitude)]}
-                  eventHandlers={{
-                    click: () => setSelectedLead(lead),
-                  }}
-                >
-                  <Popup>
-                    <div className="font-semibold text-gray-900">{lead.title}</div>
-                    <div className="text-sm text-gray-600 mt-1">{lead.location}</div>
-                    {lead.phone && (
-                      <div className="text-sm text-gray-600 mt-1 flex items-center">
-                        <Phone className="w-3 h-3 mr-1" /> {lead.phone}
-                      </div>
-                    )}
-                    {lead.email && (
-                      <div className="text-sm text-gray-600 flex items-center">
-                        <Mail className="w-3 h-3 mr-1" /> {lead.email}
-                      </div>
-                    )}
-                  </Popup>
-                </Marker>
-              ))}
+{mapLeads.map((lead) => (
+  <Marker
+    key={lead.post_id}
+    position={[parseFloat(lead.latitude), parseFloat(lead.longitude)]}
+    eventHandlers={{ click: () => setSelectedLead(lead) }}
+  >
+    <Tooltip>
+      <div className="font-semibold text-gray-900">{lead.title}</div>
+      {lead.state && <div className="text-sm text-gray-600">State: {lead.state}</div>}
+      {lead.zip_code && <div className="text-sm text-gray-600">Zip: {lead.zip_code}</div>}
+      {lead.phone && <div className="text-sm text-gray-600 mt-1">📞 {lead.phone}</div>}
+      {lead.email && <div className="text-sm text-gray-600">✉️ {lead.email}</div>}
+    </Tooltip>
+  </Marker>
+))}
             </MapContainer>
           </div>
         </div>
       </div>
 
-      {/* Enhanced Lead Detail Modal */}
+      {/* Lead Detail Modal (UPDATED with State) */}
       {selectedLead && (
         <div className="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex justify-center items-center z-[2000] p-4">
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] overflow-hidden animate-fadeIn">
@@ -806,6 +905,11 @@ const Services = () => {
                           <MapPin className="w-4 h-4 mr-1 text-gray-500" />
                           {selectedLead.location}
                         </p>
+                      </div>
+                      {/* NEW: State field */}
+                      <div>
+                        <label className="text-xs text-gray-500">State</label>
+                        <p className="text-gray-900">{selectedLead.state || 'N/A'}</p>
                       </div>
                       <div>
                         <label className="text-xs text-gray-500">Zip Code</label>
@@ -903,18 +1007,10 @@ const Services = () => {
 
       <style jsx>{`
         @keyframes fadeIn {
-          from {
-            opacity: 0;
-            transform: scale(0.95);
-          }
-          to {
-            opacity: 1;
-            transform: scale(1);
-          }
+          from { opacity: 0; transform: scale(0.95); }
+          to { opacity: 1; transform: scale(1); }
         }
-        .animate-fadeIn {
-          animation: fadeIn 0.2s ease-out;
-        }
+        .animate-fadeIn { animation: fadeIn 0.2s ease-out; }
       `}</style>
     </div>
   );
