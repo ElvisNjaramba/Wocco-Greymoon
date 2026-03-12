@@ -625,6 +625,17 @@ function Pagination({ page, totalPages, total, perPage, onPage }) {
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
+const US_STATES = [
+  "Alabama","Alaska","Arizona","Arkansas","California","Colorado","Connecticut",
+  "Delaware","Florida","Georgia","Hawaii","Idaho","Illinois","Indiana","Iowa",
+  "Kansas","Kentucky","Louisiana","Maine","Maryland","Massachusetts","Michigan",
+  "Minnesota","Mississippi","Missouri","Montana","Nebraska","Nevada",
+  "New Hampshire","New Jersey","New Mexico","New York","North Carolina",
+  "North Dakota","Ohio","Oklahoma","Oregon","Pennsylvania","Rhode Island",
+  "South Carolina","South Dakota","Tennessee","Texas","Utah","Vermont",
+  "Virginia","Washington","West Virginia","Wisconsin","Wyoming"
+];
+
 export default function Services() {
   const { logout, user } = useContext(AuthContext);
   const token = localStorage.getItem("access");
@@ -640,7 +651,10 @@ export default function Services() {
   const [selectedSubServices, setSelectedSubServices] = useState([]);
   const [expandedCategories, setExpandedCategories] = useState({});
   const [maxGroups, setMaxGroups] = useState(20);
+  const [maxPostsPerGroup, setMaxPostsPerGroup] = useState(50);
   const [fbCustomKeywords, setFbCustomKeywords] = useState("");
+  const [fbManualGroupUrls, setFbManualGroupUrls] = useState("");
+  const [scrapedGroups, setScrapedGroups] = useState([]);
   const [selectedSources, setSelectedSources] = useState(["craigslist"]);
   const [scraping, setScraping] = useState(false);
   const [runId, setRunId] = useState(null);
@@ -653,28 +667,38 @@ export default function Services() {
   const [fMinScore, setFMinScore] = useState("");
   const [fSearch, setFSearch] = useState("");
   const [fSearchDebounced, setFSearchDebounced] = useState("");
-  // Debounce fSearch so fetches only fire 400ms after typing stops
+  const [fFbGroup, setFFbGroup] = useState("");
+  const [fFbGroupDebounced, setFFbGroupDebounced] = useState("");
+
   useEffect(() => {
     const t = setTimeout(() => setFSearchDebounced(fSearch), 400);
     return () => clearTimeout(t);
   }, [fSearch]);
+
+  useEffect(() => {
+    const t = setTimeout(() => setFFbGroupDebounced(fFbGroup), 400);
+    return () => clearTimeout(t);
+  }, [fFbGroup]);
+
   const [fHasPhone, setFHasPhone] = useState(false);
-  const [fFbGroup, setFFbGroup] = useState("");
   const [fHasEmail, setFHasEmail] = useState(false);
   const [selectedLead, setSelectedLead] = useState(null);
   const [loading, setLoading] = useState(false);
   const [page, setPage] = useState(1);
   const [historyPage, setHistoryPage] = useState(1);
   const [activeTab, setActiveTab] = useState("leads");
-  // Combined into one state → one re-render per keystroke instead of two
   const [suggestions, setSuggestions] = useState({ list: [], show: false });
-  // Stable ref for the location input — prevents focus loss on re-render
   const locationInputRef = useRef(null);
-  // Track last keystroke time — polling skips fetchLeads while user is typing
+  const fbGroupFilterRef = useRef(null);
   const lastTypedRef = useRef(0);
   const [fbViewMode, setFbViewMode] = useState("cards");
+  const [selectedGroup, setSelectedGroup] = useState(null);
+  const [groupLeads, setGroupLeads] = useState([]);
+  const [groupLeadsTotal, setGroupLeadsTotal] = useState(0);
+  const [groupLeadsPage, setGroupLeadsPage] = useState(1);
+  const [groupLeadsLoading, setGroupLeadsLoading] = useState(false);
+  const [groupLeadsTotalPages, setGroupLeadsTotalPages] = useState(1);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const PER_PAGE = 25;
 
   const [totalLeads, setTotalLeads] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
@@ -690,7 +714,7 @@ export default function Services() {
       if (fSearchDebounced) params.search = fSearchDebounced;
       if (fHasPhone) params.has_phone = "true";
       if (fHasEmail) params.has_email = "true";
-      if (fFbGroup) params.fb_group = fFbGroup;
+      if (fFbGroupDebounced) params.fb_group = fFbGroupDebounced;
       const res = await axios.get(`${API}/leads/`, { headers, params });
       const data = res.data;
       if (Array.isArray(data)) {
@@ -704,11 +728,36 @@ export default function Services() {
       }
     } catch (e) { console.error(e); }
     setLoading(false);
-  }, [headers, fSource, fServiceCat, fStatus, fMinScore, fSearchDebounced, fHasPhone, fHasEmail, fFbGroup]);
+  }, [headers, fSource, fServiceCat, fStatus, fMinScore, fSearchDebounced, fHasPhone, fHasEmail, fFbGroupDebounced]);
 
   const fetchCategories = useCallback(async () => {
     try { const res = await axios.get(`${API}/meta/categories/`); setCategories(res.data.categories); } catch (e) {}
   }, []);
+
+  const fetchScrapedGroups = useCallback(async () => {
+    try { const res = await axios.get(`${API}/fb-groups/`, { headers }); setScrapedGroups(res.data.groups || []); } catch (e) {}
+  }, [headers]);
+
+  const fetchGroupLeads = useCallback(async (groupUrl, page = 1) => {
+    setGroupLeadsLoading(true);
+    try {
+      const res = await axios.get(`${API}/fb-groups/leads/`, { headers, params: { group_url: groupUrl, page, page_size: 50 } });
+      setGroupLeads(res.data.results || []);
+      setGroupLeadsTotal(res.data.total || 0);
+      setGroupLeadsPage(page);
+      setGroupLeadsTotalPages(res.data.total_pages || 1);
+    } catch (e) { console.error(e); }
+    setGroupLeadsLoading(false);
+  }, [headers]);
+
+  const deleteScrapedGroup = useCallback(async (groupUrl) => {
+    if (!window.confirm("Remove this group from the registry? It will be re-scraped next time.")) return;
+    try {
+      await axios.delete(`${API}/fb-groups/delete/`, { headers, data: { group_url: groupUrl } });
+      fetchScrapedGroups();
+      if (selectedGroup?.group_url === groupUrl) { setSelectedGroup(null); setGroupLeads([]); }
+    } catch (e) { console.error(e); }
+  }, [headers, selectedGroup, fetchScrapedGroups]);
 
   const fetchCities = useCallback(async () => {
     try { const res = await axios.get(`${API}/meta/cities/`, { headers }); setCities(res.data.cities); } catch (e) {}
@@ -728,38 +777,27 @@ export default function Services() {
   }, [headers]);
 
   useEffect(() => {
-    fetchLeads(); fetchCategories(); fetchCities(); fetchHistory(); checkScrapeStatus();
+    fetchLeads(); fetchCategories(); fetchCities(); fetchHistory(); checkScrapeStatus(); fetchScrapedGroups();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const isFirstRender = useRef(true);
   useEffect(() => {
     if (isFirstRender.current) { isFirstRender.current = false; return; }
     setPage(1); fetchLeads(1);
-  }, [fSource, fServiceCat, fStatus, fMinScore, fSearchDebounced, fHasPhone, fHasEmail, fFbGroup]);
+  }, [fSource, fServiceCat, fStatus, fMinScore, fSearchDebounced, fHasPhone, fHasEmail, fFbGroupDebounced]);
 
   useEffect(() => {
     if (!scraping) return;
     const iv = setInterval(() => {
       checkScrapeStatus();
       fetchHistory();
-      // Don't re-fetch leads while user is actively typing — it kills input focus
       if (Date.now() - lastTypedRef.current > 1000) {
         fetchLeads();
       }
     }, 3000);
     return () => clearInterval(iv);
-  }, [scraping]);
-
-  const US_STATES = [
-    "Alabama","Alaska","Arizona","Arkansas","California","Colorado","Connecticut",
-    "Delaware","Florida","Georgia","Hawaii","Idaho","Illinois","Indiana","Iowa",
-    "Kansas","Kentucky","Louisiana","Maine","Maryland","Massachusetts","Michigan",
-    "Minnesota","Mississippi","Missouri","Montana","Nebraska","Nevada",
-    "New Hampshire","New Jersey","New Mexico","New York","North Carolina",
-    "North Dakota","Ohio","Oklahoma","Oregon","Pennsylvania","Rhode Island",
-    "South Carolina","South Dakota","Tennessee","Texas","Utah","Vermont",
-    "Virginia","Washington","West Virginia","Wisconsin","Wyoming"
-  ];
+  }, [scraping, checkScrapeStatus, fetchHistory, fetchLeads]);
 
   useEffect(() => {
     if (!locationValue.trim()) {
@@ -770,14 +808,14 @@ export default function Services() {
     if (locationType === "city") {
       const matches = cities
         .filter(c => c.name.toLowerCase().includes(q) || c.display.toLowerCase().includes(q))
-        .slice(0, 8)
-        .map(c => ({ code: c.code, name: c.name, state: c.state }));
+        .slice(0, 12)
+        .map(c => ({ code: c.code, name: c.name, sub: c.state || "" }));
       setSuggestions({ list: matches, show: matches.length > 0 });
     } else if (locationType === "state") {
       const matches = US_STATES
         .filter(st => st.toLowerCase().startsWith(q) || st.toLowerCase().includes(q))
-        .slice(0, 8)
-        .map(st => ({ code: st, name: st, state: "" }));
+        .slice(0, 12)
+        .map(st => ({ code: st, name: st, sub: "" }));
       setSuggestions({ list: matches, show: matches.length > 0 });
     } else {
       setSuggestions({ list: [], show: false });
@@ -785,8 +823,9 @@ export default function Services() {
   }, [locationValue, locationType, cities]);
 
   const startScrape = async () => {
-    if (!locationValue.trim()) return alert("Enter a location.");
-    if (selectedCategories.length === 0) return alert("Select at least one category.");
+    const fbOnlyCustom = selectedSources.length === 1 && selectedSources[0] === "facebook" &&
+      (fbCustomKeywords.trim() || fbManualGroupUrls.trim());
+    if (!locationValue.trim() && !fbOnlyCustom) return alert("Enter a location.");
     if (selectedSources.length === 0) return alert("Select at least one source.");
     setScraping(true); setScrapeStatus(null); setSidebarOpen(false);
     try {
@@ -795,10 +834,13 @@ export default function Services() {
         categories: selectedCategories,
         sub_services: selectedSubServices.length > 0 ? selectedSubServices : undefined,
         max_groups: maxGroups,
+        max_posts_per_group: maxPostsPerGroup,
         sources: selectedSources,
         fb_custom_keywords: fbCustomKeywords.trim() ? fbCustomKeywords.split(",").map(k => k.trim()).filter(Boolean) : undefined,
+        // ✅ Fixed: use \n escape instead of literal newline in regex
+        fb_group_urls: fbManualGroupUrls.trim() ? fbManualGroupUrls.split(/[\n,]+/).map(u => u.trim()).filter(u => u.startsWith("http")) : undefined,
       }, { headers });
-      setRunId(res.data.run_id); fetchHistory(); setTimeout(checkScrapeStatus, 800);
+      setRunId(res.data.run_id); fetchHistory(); fetchScrapedGroups(); setTimeout(checkScrapeStatus, 800);
     } catch (e) { alert(e.response?.data?.error || "Failed to start scrape."); setScraping(false); }
   };
 
@@ -818,15 +860,12 @@ export default function Services() {
     } catch (e) { console.error(e); }
   };
 
-  // fHasPhone and fHasEmail are now server-side filters (sent as params).
-  // fServiceLabel is client-side only (label matching within returned page).
   const filtered = useMemo(() => {
     let out = [...(Array.isArray(leads) ? leads : [])];
     if (fServiceLabel) out = out.filter(l => matchesService(l, fServiceLabel));
     return out;
   }, [leads, fServiceLabel]);
 
-  // Use server pagination — page/totalPages come from the API response.
   const paginated = filtered;
   const mapLeads = filtered.filter(l => l.latitude && l.longitude);
   const fbLeads = paginated.filter(l => l.source === "FACEBOOK");
@@ -859,34 +898,55 @@ export default function Services() {
   const hasActiveFilters = fSource || fServiceCat || fServiceLabel || fStatus || fMinScore || fSearch || fHasPhone || fHasEmail || fFbGroup;
   const showActivityPanel = scrapeStatus && scrapeStatus.status !== undefined && scrapeStatus.status !== "IDLE";
 
-  const SidebarContent = () => (
+  const sidebarContent = (
     <>
-      {/* Scrape Control */}
+      {/* ── Scrape Control ─────────────────────────────────── */}
       <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
-        <div className="px-4 py-4 border-b border-white/[0.06] flex items-center justify-between">
-          <div className="flex items-center gap-2"><Zap className="w-4 h-4 text-blue-400" /><span className="text-sm font-semibold">New Scrape</span></div>
+        <div className="px-4 py-3.5 border-b border-white/[0.06] flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Zap className="w-4 h-4 text-blue-400" />
+            <span className="text-sm font-semibold">New Scrape</span>
+          </div>
           {scrapeStatus && !scraping && (
-            <Badge color={scrapeStatus.status === "SUCCEEDED" ? "green" : scrapeStatus.status === "PARTIAL" ? "yellow" : "slate"}>{scrapeStatus.status}</Badge>
+            <Badge color={scrapeStatus.status === "SUCCEEDED" ? "green" : scrapeStatus.status === "PARTIAL" ? "yellow" : "slate"}>
+              {scrapeStatus.status}
+            </Badge>
           )}
         </div>
+
         <div className="p-4 space-y-4">
-          {/* Location type */}
+
+          {/* Location type tabs */}
           <div>
             <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-2">Location Type</label>
             <div className="grid grid-cols-3 gap-1.5 bg-white/5 p-1 rounded-xl">
               {["city", "state", "zip"].map(t => (
-                <button key={t} onClick={() => { setLocationType(t); setLocationValue(""); setSuggestions({ list: [], show: false }); setTimeout(() => locationInputRef.current?.focus(), 50); }}
-                  className={`py-1.5 rounded-lg text-xs font-semibold transition-all capitalize ${locationType === t ? "bg-blue-600 text-white shadow-lg shadow-blue-500/20" : "text-white/40 hover:text-white/70"}`}>{t}</button>
+                <button key={t}
+                  onClick={() => {
+                    setLocationType(t);
+                    setLocationValue("");
+                    setSuggestions({ list: [], show: false });
+                    setTimeout(() => locationInputRef.current?.focus(), 50);
+                  }}
+                  className={`py-1.5 rounded-lg text-xs font-semibold transition-all capitalize ${locationType === t ? "bg-blue-600 text-white shadow-lg shadow-blue-500/20" : "text-white/40 hover:text-white/70"}`}>
+                  {t}
+                </button>
               ))}
             </div>
+            {selectedSources.includes("craigslist") && locationType !== "zip" && (
+              <p className="text-[10px] text-orange-400/60 mt-1.5 flex items-center gap-1">
+                <span>🔶</span> Craigslist uses 330 specific US cities — nearest city will be used.
+              </p>
+            )}
           </div>
+
           {/* Location input */}
           <div className="relative">
             <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-2">
-              {locationType === "city" ? "City Name" : locationType === "state" ? "State Name" : "ZIP Code"}
+              {locationType === "city" ? "City" : locationType === "state" ? "State" : "ZIP Code"}
             </label>
             <div className="relative">
-              <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-white/30" />
+              <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-white/30 pointer-events-none" />
               <input
                 ref={locationInputRef}
                 type="text"
@@ -895,28 +955,45 @@ export default function Services() {
                 autoCorrect="off"
                 autoCapitalize="off"
                 spellCheck="false"
+                onFocus={() => {
+                  if (locationType !== "zip" && !locationValue.trim()) {
+                    if (locationType === "city") {
+                      setSuggestions({ list: cities.slice(0, 50).map(c => ({ code: c.code, name: c.name, state: c.state })), show: true });
+                    } else {
+                      setSuggestions({ list: US_STATES.map(st => ({ code: st, name: st, state: "" })), show: true });
+                    }
+                  }
+                }}
                 onChange={e => { lastTypedRef.current = Date.now(); setLocationValue(e.target.value); }}
-                onBlur={() => setTimeout(() => setSuggestions(s => ({ ...s, show: false })), 150)}
-                placeholder={locationType === "city" ? "e.g. Houston" : locationType === "state" ? "e.g. Texas" : "e.g. 77001"}
+                onBlur={() => setTimeout(() => setSuggestions(s => ({ ...s, show: false })), 180)}
+                placeholder={locationType === "city" ? "Search or select a city…" : locationType === "state" ? "Search or select a state…" : "e.g. 77001"}
                 className="w-full bg-white/5 border border-white/10 rounded-xl pl-9 pr-4 py-2.5 text-sm text-white placeholder-white/20 focus:outline-none focus:border-blue-500/60 transition-all"
               />
             </div>
-            {suggestions.show && (
-              <div className="absolute z-50 left-0 right-0 mt-1 bg-[#1a1d27] border border-white/10 rounded-xl shadow-2xl overflow-hidden">
-                {suggestions.list.map(c => (
-                  <button key={c.code} onClick={() => {
-                    setLocationValue(c.name);
-                    setSuggestions({ list: [], show: false });
-                    // Return focus to input after picking a suggestion
-                    setTimeout(() => locationInputRef.current?.focus(), 0);
-                  }}
-                    className="w-full text-left px-4 py-2.5 text-sm text-white/70 hover:bg-white/5 hover:text-white flex justify-between items-center transition-colors">
-                    <span>{c.name}</span><span className="text-white/30 text-xs">{c.state}</span>
-                  </button>
-                ))}
+            {suggestions.show && suggestions.list.length > 0 && (
+              <div className="absolute z-50 left-0 right-0 mt-1 bg-[#16192a] border border-white/10 rounded-xl shadow-2xl overflow-hidden">
+                <div className="max-h-52 overflow-y-auto">
+                  {suggestions.list.map(c => (
+                    <button key={c.code} onMouseDown={e => e.preventDefault()} onClick={() => {
+                      setLocationValue(c.name);
+                      setSuggestions({ list: [], show: false });
+                      setTimeout(() => locationInputRef.current?.focus(), 0);
+                    }}
+                      className="w-full text-left px-4 py-2.5 text-sm text-white/70 hover:bg-white/[0.07] hover:text-white flex justify-between items-center transition-colors">
+                      <span>{c.name}</span>
+                      {c.state && <span className="text-white/25 text-xs ml-2 flex-shrink-0">{c.state}</span>}
+                    </button>
+                  ))}
+                </div>
+                {locationType === "city" && cities.length > 50 && !locationValue.trim() && (
+                  <div className="px-4 py-2 border-t border-white/[0.06] text-[10px] text-white/20">
+                    Showing 50 of {cities.length} cities — type to search all
+                  </div>
+                )}
               </div>
             )}
           </div>
+
           {/* Categories */}
           <div>
             <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-2">Categories</label>
@@ -967,53 +1044,95 @@ export default function Services() {
               })}
             </div>
           </div>
-          {/* Max groups */}
-          {selectedSources.includes("facebook") && (
-            <div className="space-y-3">
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30">FB Groups to Find</label>
-                  <span className="text-[10px] text-white/25">max 100</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <input type="range" min={5} max={100} step={5} value={maxGroups}
-                    onChange={e => setMaxGroups(Number(e.target.value))} className="flex-1 accent-indigo-500 cursor-pointer" />
-                  <span className="w-9 text-right text-sm font-bold text-indigo-300 tabular-nums">{maxGroups}</span>
-                </div>
-                <p className="text-[10px] text-white/20 mt-1.5">Fewer groups = faster run.</p>
-              </div>
-              <div>
-                <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-2">
-                  Custom Search Terms <span className="text-white/20 normal-case font-normal ml-1">(optional)</span>
-                </label>
-                <input
-                  type="text"
-                  value={fbCustomKeywords}
-                  onChange={e => { lastTypedRef.current = Date.now(); setFbCustomKeywords(e.target.value); }}
-                  placeholder="e.g. house cleaning groups in texas"
-                  autoComplete="off" autoCorrect="off" spellCheck="false"
-                  className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-white placeholder-white/20 focus:outline-none focus:border-blue-500/60 transition-all"
-                />
-                <p className="text-[10px] text-white/20 mt-1.5">Added alongside category keywords. Separate multiple with commas.</p>
-              </div>
-            </div>
-          )}
+
           {/* Sources */}
           <div>
             <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-2">Sources</label>
             <div className="grid grid-cols-2 gap-2">
-              {[{ key: "craigslist", label: "Craigslist", icon: "🔶" }, { key: "facebook", label: "Facebook", icon: "🔷" }].map(s => (
-                <button key={s.key} onClick={() => toggleSource(s.key)}
-                  className={`flex items-center gap-2 p-3 rounded-xl border text-xs font-semibold transition-all ${selectedSources.includes(s.key) ? "bg-blue-600/10 border-blue-500/40 text-white" : "bg-white/[0.02] border-white/[0.06] text-white/40 hover:border-white/20"}`}>
-                  <span>{s.icon}</span><span>{s.label}</span>
+              {[{ key: "craigslist", label: "Craigslist", icon: "🔶" }, { key: "facebook", label: "Facebook", icon: "🔷" }].map(src => (
+                <button key={src.key} onClick={() => toggleSource(src.key)}
+                  className={`flex items-center gap-2 p-3 rounded-xl border text-xs font-semibold transition-all ${selectedSources.includes(src.key) ? "bg-blue-600/10 border-blue-500/40 text-white" : "bg-white/[0.02] border-white/[0.06] text-white/40 hover:border-white/20"}`}>
+                  <span>{src.icon}</span><span>{src.label}</span>
                 </button>
               ))}
             </div>
           </div>
-          {/* Action */}
+
+          {/* Facebook-only settings */}
+          {selectedSources.includes("facebook") && (
+            <div className="space-y-3 pt-1">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30">Groups to Find</label>
+                  <span className="text-[10px] text-white/25">{maxGroups} max</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input type="range" min={5} max={100} step={5} value={maxGroups}
+                    onChange={e => setMaxGroups(Number(e.target.value))} className="flex-1 accent-indigo-500 cursor-pointer" />
+                  <span className="w-8 text-right text-sm font-bold text-indigo-300 tabular-nums">{maxGroups}</span>
+                </div>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30">Posts per Group</label>
+                  <span className="text-[10px] text-white/25">{maxPostsPerGroup} posts</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input type="range" min={10} max={200} step={10} value={maxPostsPerGroup}
+                    onChange={e => setMaxPostsPerGroup(Number(e.target.value))} className="flex-1 accent-indigo-500 cursor-pointer" />
+                  <span className="w-10 text-right text-sm font-bold text-indigo-300 tabular-nums">{maxPostsPerGroup}</span>
+                </div>
+                <p className="text-[10px] text-white/20 mt-1">How many posts to fetch from each group.</p>
+              </div>
+
+              <div>
+                <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-1.5">
+                  Custom Search Terms
+                  <span className="text-white/20 normal-case font-normal ml-1">(optional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={fbCustomKeywords}
+                  autoComplete="off" autoCorrect="off" spellCheck="false"
+                  onChange={e => { lastTypedRef.current = Date.now(); setFbCustomKeywords(e.target.value); }}
+                  placeholder="e.g. house cleaning groups in texas"
+                  className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-white placeholder-white/20 focus:outline-none focus:border-blue-500/60 transition-all"
+                />
+                <p className="text-[10px] text-white/20 mt-1">
+                  Comma-separate multiple terms.{" "}
+                  {selectedSources.length === 1 && selectedSources[0] === "facebook" && fbCustomKeywords.trim()
+                    ? <span className="text-indigo-300/60">Location not required when using custom terms only.</span>
+                    : "Added alongside category keywords."}
+                </p>
+              </div>
+
+              <div>
+                <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-1.5">
+                  Scrape Specific Groups
+                  <span className="text-white/20 normal-case font-normal ml-1">(optional)</span>
+                </label>
+                <textarea
+                  value={fbManualGroupUrls}
+                  autoComplete="off" spellCheck="false"
+                  onChange={e => { lastTypedRef.current = Date.now(); setFbManualGroupUrls(e.target.value); }}
+                  placeholder={"https://www.facebook.com/groups/…\nOne URL per line"}
+                  rows={3}
+                  className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-xs text-white placeholder-white/20 focus:outline-none focus:border-indigo-500/60 transition-all resize-none leading-relaxed font-mono"
+                />
+                <p className="text-[10px] text-white/20 mt-1">Paste group URLs to scrape directly — skips the group discovery step. Already-scraped groups are skipped automatically.</p>
+              </div>
+            </div>
+          )}
+
+          {/* Launch / running */}
           {!scraping ? (
             <button onClick={startScrape}
-              disabled={!locationValue.trim() || selectedCategories.length === 0 || selectedSources.length === 0}
+              disabled={(
+                !locationValue.trim() &&
+                !fbManualGroupUrls.trim() &&
+                !(selectedSources.length === 1 && selectedSources[0] === "facebook" && fbCustomKeywords.trim())
+              ) || selectedSources.length === 0}
               className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-600 to-violet-600 text-white text-sm font-semibold hover:from-blue-500 hover:to-violet-500 transition-all shadow-lg shadow-blue-500/20 disabled:opacity-30 disabled:cursor-not-allowed">
               Launch Scrape
             </button>
@@ -1035,73 +1154,105 @@ export default function Services() {
 
       <ActivityPanel scrapeStatus={scrapeStatus} visible={showActivityPanel} />
 
-      {/* Filters */}
+      {/* ── Filters ──────────────────────────────────────────── */}
       <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
-        <div className="px-4 py-4 border-b border-white/[0.06] flex items-center justify-between">
-          <div className="flex items-center gap-2"><Filter className="w-4 h-4 text-white/40" /><span className="text-sm font-semibold">Filters</span>{hasActiveFilters && <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />}</div>
-          {hasActiveFilters && <button onClick={resetFilters} className="text-[11px] text-white/30 hover:text-white/60 transition-colors">Clear all</button>}
-        </div>
-        <div className="p-4 space-y-4">
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-white/30" />
-            <input type="text" placeholder="Search title or location…" value={fSearch} onChange={e => { lastTypedRef.current = Date.now(); setFSearch(e.target.value); }}
-              className="w-full bg-white/5 border border-white/10 rounded-xl pl-9 pr-4 py-2 text-xs text-white placeholder-white/20 focus:outline-none focus:border-blue-500/60 transition-all" />
+        <div className="px-4 py-3.5 border-b border-white/[0.06] flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Filter className="w-4 h-4 text-white/40" />
+            <span className="text-sm font-semibold">Filters</span>
+            {hasActiveFilters && <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />}
           </div>
+          {hasActiveFilters && (
+            <button onClick={resetFilters} className="text-[11px] text-white/30 hover:text-white/60 transition-colors">Clear all</button>
+          )}
+        </div>
+
+        <div className="p-4 space-y-3">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-white/30 pointer-events-none" />
+            <input
+              type="text"
+              placeholder="Search title or location…"
+              value={fSearch}
+              autoComplete="off" autoCorrect="off" spellCheck="false"
+              onChange={e => { lastTypedRef.current = Date.now(); setFSearch(e.target.value); }}
+              className="w-full bg-white/5 border border-white/10 rounded-xl pl-9 pr-4 py-2.5 text-xs text-white placeholder-white/20 focus:outline-none focus:border-blue-500/60 transition-all"
+            />
+          </div>
+
           <div>
             <label className="text-[10px] font-semibold uppercase tracking-widest text-white/25 block mb-1.5">Source</label>
             <div className="grid grid-cols-3 gap-1 bg-white/5 p-1 rounded-lg">
-              {[["", "All"], ["CRAIGSLIST", "CL"], ["FACEBOOK", "FB"]].map(([v, l]) => (
-                <button key={v} onClick={() => setFSource(v)} className={`py-1.5 rounded-md text-[11px] font-semibold transition-all ${fSource === v ? "bg-white/10 text-white" : "text-white/30 hover:text-white/60"}`}>{l}</button>
+              {[["", "All"], ["CRAIGSLIST", "CL 🔶"], ["FACEBOOK", "FB 🔷"]].map(([v, l]) => (
+                <button key={v} onClick={() => setFSource(v)}
+                  className={`py-1.5 rounded-md text-[11px] font-semibold transition-all ${fSource === v ? "bg-white/10 text-white" : "text-white/30 hover:text-white/60"}`}>{l}</button>
               ))}
             </div>
           </div>
+
           <div>
             <label className="text-[10px] font-semibold uppercase tracking-widest text-white/25 block mb-1.5">Category</label>
             <select value={fServiceCat} onChange={e => setFServiceCat(e.target.value)}
-              className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-blue-500/60 transition-all">
+              className="w-full bg-[#1a1d2e] border border-white/10 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-blue-500/60 transition-all cursor-pointer">
               <option value="">All categories</option>
               {categories.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
             </select>
           </div>
+
           <div>
             <label className="text-[10px] font-semibold uppercase tracking-widest text-white/25 block mb-1.5">Service Type</label>
             <select value={fServiceLabel} onChange={e => setFServiceLabel(e.target.value)}
-              className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-blue-500/60 transition-all">
+              className="w-full bg-[#1a1d2e] border border-white/10 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-blue-500/60 transition-all cursor-pointer">
               <option value="">All services</option>
               {Object.entries(SERVICE_TAXONOMY).map(([group, g]) => (
-                <optgroup key={group} label={`── ${group} ──`}>{g.services.map(s => <option key={s.label} value={s.label}>{s.label}</option>)}</optgroup>
+                <optgroup key={group} label={`── ${group} ──`}>
+                  {g.services.map(sv => <option key={sv.label} value={sv.label}>{sv.label}</option>)}
+                </optgroup>
               ))}
             </select>
           </div>
+
           <div>
             <label className="text-[10px] font-semibold uppercase tracking-widest text-white/25 block mb-1.5">Status</label>
             <select value={fStatus} onChange={e => setFStatus(e.target.value)}
-              className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-blue-500/60 transition-all">
+              className="w-full bg-[#1a1d2e] border border-white/10 rounded-xl px-3 py-2.5 text-xs text-white focus:outline-none focus:border-blue-500/60 transition-all cursor-pointer">
               <option value="">All statuses</option>
-              {["NEW","CONTACTED","QUALIFIED","WON","LOST"].map(s => <option key={s} value={s}>{s}</option>)}
+              {["NEW", "CONTACTED", "QUALIFIED", "WON", "LOST"].map(st => (
+                <option key={st} value={st}>{st}</option>
+              ))}
             </select>
           </div>
+
           <div>
-            <label className="text-[10px] font-semibold uppercase tracking-widest text-white/25 block mb-1.5">Min Score: <span className="text-white/60">{fMinScore || "0"}</span></label>
-            <input type="range" min="0" max="100" value={fMinScore || 0} onChange={e => setFMinScore(e.target.value === "0" ? "" : e.target.value)} className="w-full accent-blue-500" />
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-[10px] font-semibold uppercase tracking-widest text-white/25">Min Score</label>
+              <span className="text-[11px] font-bold text-white/50 tabular-nums">{fMinScore || "0"}</span>
+            </div>
+            <input type="range" min="0" max="100" value={fMinScore || 0}
+              onChange={e => setFMinScore(e.target.value === "0" ? "" : e.target.value)}
+              className="w-full accent-blue-500 cursor-pointer" />
           </div>
-          <div className="flex gap-3">
-            {[{ label: "Has Phone", icon: Phone, val: fHasPhone, set: setFHasPhone }, { label: "Has Email", icon: Mail, val: fHasEmail, set: setFHasEmail }].map(({ label, icon: Icon, val, set }) => (
+
+          <div className="grid grid-cols-2 gap-2">
+            {[{ label: "Has Phone", icon: Phone, val: fHasPhone, set: setFHasPhone },
+              { label: "Has Email", icon: Mail, val: fHasEmail, set: setFHasEmail }].map(({ label, icon: Icon, val, set }) => (
               <button key={label} onClick={() => set(p => !p)}
-                className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl border text-[11px] font-semibold transition-all ${val ? "bg-emerald-600/10 border-emerald-500/40 text-emerald-400" : "bg-white/[0.02] border-white/[0.06] text-white/30 hover:border-white/20"}`}>
+                className={`flex items-center justify-center gap-1.5 py-2.5 rounded-xl border text-[11px] font-semibold transition-all ${val ? "bg-emerald-600/10 border-emerald-500/40 text-emerald-400" : "bg-white/[0.02] border-white/[0.06] text-white/30 hover:border-white/20 hover:text-white/50"}`}>
                 <Icon className="w-3 h-3" />{label}
               </button>
             ))}
           </div>
+
           {(fSource === "FACEBOOK" || fSource === "") && (
             <div>
               <label className="text-[10px] font-semibold uppercase tracking-widest text-white/25 block mb-1.5">Filter by Group</label>
               <input
+                ref={fbGroupFilterRef}
                 type="text"
                 value={fFbGroup}
                 onChange={e => { lastTypedRef.current = Date.now(); setFFbGroup(e.target.value); }}
                 placeholder="Group name…"
-                autoComplete="off" spellCheck="false"
+                autoComplete="off" autoCorrect="off" spellCheck="false"
                 className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-white placeholder-white/20 focus:outline-none focus:border-blue-500/50 transition-all"
               />
             </div>
@@ -1124,7 +1275,7 @@ export default function Services() {
               <span className="text-sm font-semibold">Controls</span>
               <button onClick={() => setSidebarOpen(false)} className="text-white/40 hover:text-white transition-colors"><X className="w-5 h-5" /></button>
             </div>
-            <SidebarContent />
+            {sidebarContent}
           </div>
         </div>
       )}
@@ -1135,7 +1286,7 @@ export default function Services() {
           <div className="flex items-center gap-2">
             <button onClick={() => setSidebarOpen(true)} className="lg:hidden text-white/40 hover:text-white transition-colors"><Menu className="w-5 h-5" /></button>
             <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center flex-shrink-0"><Target className="w-4 h-4 text-white" /></div>
-            <span className="font-semibold text-sm tracking-tight">LeadPipe</span>
+            <span className="font-semibold text-sm tracking-tight">GreyMoon Scraper</span>
             <span className="text-white/20 text-xs hidden sm:block">|</span>
             <span className="text-white/40 text-xs hidden sm:block">contractor intelligence</span>
           </div>
@@ -1166,7 +1317,7 @@ export default function Services() {
       <div className="max-w-[1400px] mx-auto px-4 lg:px-6 py-6 lg:grid lg:grid-cols-[300px_1fr] xl:grid-cols-[330px_1fr] gap-6 lg:gap-8 items-start">
         {/* Desktop sidebar */}
         <aside className="hidden lg:block space-y-4 sticky top-[72px] max-h-[calc(100vh-88px)] overflow-y-auto pr-1">
-          <SidebarContent />
+          {sidebarContent}
         </aside>
 
         {/* Main */}
@@ -1179,11 +1330,11 @@ export default function Services() {
             {/* Stats */}
             <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
               {[
-                { label: "Total",      value: stats.total,     icon: Database, color: "text-blue-400" },
-                { label: "Craigslist", value: stats.cl,        icon: Globe,    color: "text-orange-400" },
-                { label: "Facebook",   value: stats.fb,        icon: Layers,   color: "text-indigo-400" },
-                { label: "Phones",     value: stats.withPhone, icon: Phone,    color: "text-emerald-400" },
-                { label: "Emails",     value: stats.withEmail, icon: Mail,     color: "text-violet-400" },
+                { label: "Total",      value: stats.total,     icon: Database,   color: "text-blue-400" },
+                { label: "Craigslist", value: stats.cl,        icon: Globe,      color: "text-orange-400" },
+                { label: "Facebook",   value: stats.fb,        icon: Layers,     color: "text-indigo-400" },
+                { label: "Phones",     value: stats.withPhone, icon: Phone,      color: "text-emerald-400" },
+                { label: "Emails",     value: stats.withEmail, icon: Mail,       color: "text-violet-400" },
                 { label: "Avg Score",  value: stats.avgScore,  icon: TrendingUp, color: "text-amber-400" },
               ].map(({ label, value, icon: Icon, color }) => (
                 <div key={label} className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-3">
@@ -1197,7 +1348,7 @@ export default function Services() {
             {/* Tab bar */}
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div className="flex gap-1 bg-white/[0.03] border border-white/[0.06] p-1 rounded-xl">
-                {[{ id: "leads", label: "Leads", icon: Database }, { id: "map", label: "Map", icon: MapPin }, { id: "history", label: "History", icon: Clock }].map(t => (
+                {[{ id: "leads", label: "Leads", icon: Database }, { id: "groups", label: "Groups", icon: Users }, { id: "map", label: "Map", icon: MapPin }, { id: "history", label: "History", icon: Clock }].map(t => (
                   <button key={t.id} onClick={() => setActiveTab(t.id)}
                     className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold transition-all ${activeTab === t.id ? "bg-white/10 text-white" : "text-white/30 hover:text-white/60"}`}>
                     <t.icon className="w-3.5 h-3.5" />
@@ -1274,6 +1425,129 @@ export default function Services() {
                     <Pagination page={page} totalPages={totalPages} total={totalLeads} perPage={50}
                       onPage={p => { setPage(p); fetchLeads(p); window.scrollTo({ top: 0, behavior: "smooth" }); }} />
                   </>
+                )}
+              </div>
+            )}
+
+            {/* Groups tab */}
+            {activeTab === "groups" && (
+              <div className="space-y-4">
+                <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
+                  <div className="px-4 py-3.5 border-b border-white/[0.06] flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Users className="w-4 h-4 text-indigo-400" />
+                      <span className="text-sm font-semibold">Scraped Facebook Groups</span>
+                      <span className="text-[11px] text-white/30 bg-white/5 px-2 py-0.5 rounded-full">{scrapedGroups.length}</span>
+                    </div>
+                    <button onClick={fetchScrapedGroups} className="text-white/30 hover:text-white/60 transition-colors">
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+
+                  {scrapedGroups.length === 0 ? (
+                    <div className="py-12 flex flex-col items-center gap-3 text-white/20">
+                      <Users className="w-8 h-8 text-white/10" />
+                      <span className="text-sm">No groups scraped yet</span>
+                      <span className="text-[11px]">Run a Facebook scrape to populate this list</span>
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-white/[0.04]">
+                      {scrapedGroups.map(g => (
+                        <div key={g.group_url}
+                          className={`px-4 py-3 flex items-center gap-3 hover:bg-white/[0.02] transition-colors cursor-pointer ${selectedGroup?.group_url === g.group_url ? "bg-indigo-500/5 border-l-2 border-indigo-500" : ""}`}
+                          onClick={() => { setSelectedGroup(g); fetchGroupLeads(g.group_url, 1); }}>
+                          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500/30 to-purple-600/30 border border-indigo-500/20 flex items-center justify-center flex-shrink-0 text-indigo-300 text-xs font-bold">
+                            {(g.group_name || "?").charAt(0).toUpperCase()}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="text-sm font-medium text-white/80 truncate">{g.group_name || g.group_url}</div>
+                            <div className="flex items-center gap-3 mt-0.5">
+                              <span className="text-[11px] text-white/30">{g.post_count} posts</span>
+                              <span className="text-[11px] text-white/20">
+                                {g.last_scraped ? new Date(g.last_scraped).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—"}
+                              </span>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            <a href={g.group_url} target="_blank" rel="noopener noreferrer"
+                              onClick={e => e.stopPropagation()}
+                              className="text-white/20 hover:text-indigo-400 transition-colors p-1">
+                              <ExternalLink className="w-3.5 h-3.5" />
+                            </a>
+                            <button onClick={e => { e.stopPropagation(); deleteScrapedGroup(g.group_url); }}
+                              className="text-white/20 hover:text-red-400 transition-colors p-1" title="Remove from registry (allows re-scrape)">
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {selectedGroup && (
+                  <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
+                    <div className="px-4 py-3.5 border-b border-white/[0.06] flex items-center justify-between">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold truncate">{selectedGroup.group_name || selectedGroup.group_url}</div>
+                        <div className="text-[11px] text-white/30 mt-0.5">{groupLeadsTotal} posts stored</div>
+                      </div>
+                      <button onClick={() => { setSelectedGroup(null); setGroupLeads([]); }}
+                        className="text-white/30 hover:text-white/60 ml-3 flex-shrink-0">
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+
+                    {groupLeadsLoading ? (
+                      <div className="py-10 flex items-center justify-center">
+                        <Loader className="w-5 h-5 text-indigo-400 animate-spin" />
+                      </div>
+                    ) : groupLeads.length === 0 ? (
+                      <div className="py-8 text-center text-white/30 text-sm">No posts stored for this group yet.</div>
+                    ) : (
+                      <div>
+                        <div className="divide-y divide-white/[0.04]">
+                          {groupLeads.map(lead => (
+                            <div key={lead.post_id}
+                              className="px-4 py-3 hover:bg-white/[0.02] transition-colors cursor-pointer"
+                              onClick={() => setSelectedLead(lead)}>
+                              <div className="flex items-start gap-3">
+                                <div className="w-7 h-7 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0 mt-0.5">
+                                  {(lead.raw_json?.authorName || lead.title || "?").charAt(0).toUpperCase()}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    {lead.raw_json?.authorName && <span className="text-xs font-semibold text-white/80 truncate max-w-[160px]">{lead.raw_json.authorName}</span>}
+                                    <ScoreDot score={lead.score} />
+                                    <StatusSelect value={lead.status} onChange={v => updateLeadStatus(lead.post_id, v)} />
+                                  </div>
+                                  <p className="text-xs text-white/50 mt-1 line-clamp-2 leading-relaxed">{lead.post?.slice(0, 180)}</p>
+                                  <div className="flex items-center gap-3 mt-1.5 flex-wrap">
+                                    {lead.phone && <span className="text-[11px] text-emerald-400/80 flex items-center gap-1"><Phone className="w-2.5 h-2.5" />{lead.phone}</span>}
+                                    {lead.email && <span className="text-[11px] text-blue-400/80 flex items-center gap-1"><Mail className="w-2.5 h-2.5" />{lead.email}</span>}
+                                    {lead.location && <span className="text-[11px] text-white/25 flex items-center gap-1"><MapPin className="w-2.5 h-2.5" />{lead.location}</span>}
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        {groupLeadsTotalPages > 1 && (
+                          <div className="px-4 py-3 border-t border-white/[0.06] flex items-center justify-between">
+                            <span className="text-[11px] text-white/30">Page {groupLeadsPage} of {groupLeadsTotalPages}</span>
+                            <div className="flex gap-2">
+                              <button disabled={groupLeadsPage <= 1}
+                                onClick={() => { const p = groupLeadsPage - 1; setGroupLeadsPage(p); fetchGroupLeads(selectedGroup.group_url, p); }}
+                                className="px-3 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">‹</button>
+                              <button disabled={groupLeadsPage >= groupLeadsTotalPages}
+                                onClick={() => { const p = groupLeadsPage + 1; setGroupLeadsPage(p); fetchGroupLeads(selectedGroup.group_url, p); }}
+                                className="px-3 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">›</button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
             )}

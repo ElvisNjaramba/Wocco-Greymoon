@@ -108,6 +108,9 @@ class ScrapeRun(models.Model):
     leads_collected = models.IntegerField(default=0)
     leads_skipped = models.IntegerField(default=0)
 
+    # ── FB scrape settings ───────────────────────────────────────
+    max_posts_per_group = models.IntegerField(default=50)
+
     # ── Cancellation ──────────────────────────────────────────────
     # apify_run_ids: list of active Apify actor run IDs for this scrape run.
     # The pipeline registers each Apify run here immediately after launch,
@@ -127,3 +130,35 @@ class ScrapeRun(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+
+class ScrapedFbGroup(models.Model):
+    """
+    Tracks every Facebook group that has been scraped.
+    The pipeline checks this before scraping a group — if it already
+    exists it is skipped entirely, preventing duplicate posts.
+    """
+    group_url   = models.URLField(max_length=1000, unique=True, db_index=True)
+    group_name  = models.CharField(max_length=500, blank=True)
+    # Number of posts scraped from this group across all runs
+    post_count  = models.IntegerField(default=0)
+    last_scraped = models.DateTimeField(auto_now=True)
+    first_scraped = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.group_name or self.group_url} ({self.post_count} posts)"
+
+    class Meta:
+        ordering = ["-last_scraped"]
+
+
+class ScrapedFbPost(models.Model):
+    """
+    Tracks every Facebook post URL that has been scraped, so we never
+    store the same post twice even across different scrape runs or groups.
+    """
+    post_url   = models.URLField(max_length=1000, unique=True, db_index=True)
+    group_url  = models.URLField(max_length=1000, blank=True, db_index=True)
+    scraped_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-scraped_at"]

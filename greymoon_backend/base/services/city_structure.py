@@ -1,7 +1,3 @@
-# Every code here is the actual Craigslist subdomain verified from
-# https://www.craigslist.org/about/sites  — March 2026
-# URL pattern: https://{code}.craigslist.org/search/{category}
-
 US_CITY_STRUCTURE = {
 
     "Alabama": {"name": "Alabama", "regions": [

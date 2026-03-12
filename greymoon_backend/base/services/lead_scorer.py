@@ -1,10 +1,3 @@
-# ============================================================
-#  lead_scorer.py
-#  Enhanced version of your original calculate_lead_score.
-#  Now handles both Craigslist and Facebook leads, with
-#  source-specific scoring signals.
-# ============================================================
-
 from datetime import datetime, timezone
 
 HIGH_VALUE_KEYWORDS = [

@@ -2,20 +2,58 @@ import requests
 import time
 from django.conf import settings
 
-ACTOR_ID = "apify~facebook-groups-scraper"
+ACTOR_ID                 = "apify~facebook-groups-scraper"
+POLL_INTERVAL            = 5
+DEFAULT_MAX_POSTS_PER_GROUP = 50
+CHUNK_SIZE               = 5
 
-POLL_INTERVAL = 5
-MAX_POSTS_PER_GROUP = 50
-CHUNK_SIZE = 5
 
 def _apify_headers():
     return {"Authorization": f"Bearer {settings.APIFY_TOKEN}"}
 
-def build_scraper_payload(group_urls: list[str]) -> dict:
-    start_urls = [{"url": url} for url in group_urls]
+
+def _abort_apify_run(run_id: str):
+    """Best-effort abort of a single Apify actor run."""
+    try:
+        requests.post(
+            f"https://api.apify.com/v2/actor-runs/{run_id}/abort",
+            headers=_apify_headers(),
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[FB Groups Scraper] Could not abort run {run_id}: {e}")
+
+
+def _register_apify_run(scrape_run_id, apify_run_id: str):
+
+    if not scrape_run_id:
+        return
+    try:
+        from base.models import ScrapeRun
+        run = ScrapeRun.objects.filter(pk=scrape_run_id).first()
+        if run:
+            ids = run.apify_run_ids or []
+            if apify_run_id not in ids:
+                ids.append(apify_run_id)
+            ScrapeRun.objects.filter(pk=scrape_run_id).update(apify_run_ids=ids)
+    except Exception as e:
+        print(f"[FB Groups Scraper] Could not register Apify run ID: {e}")
+
+
+def _is_cancel_requested(scrape_run_id) -> bool:
+    if not scrape_run_id:
+        return False
+    try:
+        from base.models import ScrapeRun
+        return ScrapeRun.objects.filter(pk=scrape_run_id, cancel_requested=True).exists()
+    except Exception:
+        return False
+
+
+def build_scraper_payload(group_urls, max_posts_per_group=DEFAULT_MAX_POSTS_PER_GROUP):
     return {
-        "startUrls": start_urls,
-        "maxPostsPerGroup": MAX_POSTS_PER_GROUP,
+        "startUrls": [{"url": url} for url in group_urls],
+        "maxPostsPerGroup": max_posts_per_group,
         "proxyConfiguration": {
             "useApifyProxy": True,
             "apifyProxyGroups": ["RESIDENTIAL"],
@@ -23,53 +61,76 @@ def build_scraper_payload(group_urls: list[str]) -> dict:
         },
     }
 
-def start_groups_scraper(group_urls: list[str]) -> tuple[str, str]:
+
+def _launch_and_guard(
+    group_urls: list[str],
+    max_posts_per_group: int,
+    scrape_run_id,
+) -> tuple[str, str] | None:
+
     if not group_urls:
         raise ValueError("[FB Groups Scraper] No group URLs provided.")
-    payload = build_scraper_payload(group_urls)
-    url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
-    resp = requests.post(url, json=payload, headers=_apify_headers())
-    resp.raise_for_status()
-    data = resp.json()["data"]
-    print(f"[FB Groups Scraper] Started run: {data['id']} for {len(group_urls)} groups")
-    return data["id"], data["defaultDatasetId"]
 
-def wait_for_run(run_id: str):
+    payload = build_scraper_payload(group_urls, max_posts_per_group)
+    resp = requests.post(
+        f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs",
+        json=payload,
+        headers=_apify_headers(),
+    )
+    resp.raise_for_status()
+    data       = resp.json()["data"]
+    run_id     = data["id"]
+    dataset_id = data["defaultDatasetId"]
+
+    # Register before post-launch cancel check
+    _register_apify_run(scrape_run_id, run_id)
+
+    if _is_cancel_requested(scrape_run_id):
+        _abort_apify_run(run_id)
+        return None
+
+    return run_id, dataset_id
+
+
+def wait_for_run(run_id: str, scrape_run_id=None, log_fn=None):
+    """Poll until done. Aborts the actor immediately if cancel is detected."""
+    log = log_fn or print
     url = f"https://api.apify.com/v2/actor-runs/{run_id}"
     while True:
         res = requests.get(url, headers=_apify_headers())
         res.raise_for_status()
         status = res.json()["data"]["status"]
-        print(f"[FB Groups Scraper] Status: {status}")
+        log(f"[FB Groups Scraper] Actor status: {status}")
+
         if status == "SUCCEEDED":
             return
         if status in ["FAILED", "ABORTED", "TIMED-OUT"]:
-            raise Exception(f"[FB Groups Scraper] Run {run_id} failed: {status}")
+            raise Exception(f"Run {run_id} ended with status: {status}")
+
+        if _is_cancel_requested(scrape_run_id):
+            _abort_apify_run(run_id)
+            raise Exception(f"Run {run_id} cancelled by user")
+
         time.sleep(POLL_INTERVAL)
 
-def fetch_posts(dataset_id: str) -> list[dict]:
-    url = (
-        f"https://api.apify.com/v2/datasets/{dataset_id}"
-        f"/items?clean=true&limit=1000"
+
+def fetch_posts(dataset_id: str, log_fn=None) -> list[dict]:
+    log = log_fn or print
+    resp = requests.get(
+        f"https://api.apify.com/v2/datasets/{dataset_id}/items?clean=true&limit=5000",
+        headers=_apify_headers(),
     )
-    resp = requests.get(url, headers=_apify_headers())
     resp.raise_for_status()
     posts = resp.json()
-    print(f"[FB Groups Scraper] Retrieved {len(posts)} posts")
+    log(f"[FB Groups Scraper] Retrieved {len(posts)} posts from dataset")
     return posts
 
+
 def _inject_group_url(posts: list[dict], chunk_urls: list[str]) -> list[dict]:
-    """
-    Apify's FB scraper returns posts but doesn't always include which
-    group URL the post came from. We inject it based on position/groupUrl
-    field, falling back to tagging posts with the chunk's URLs so the
-    normalizer can store group attribution on each lead.
-    """
-    if not posts:
+    """Tag posts with groupUrl if the actor didn't include it."""
+    if not posts or not chunk_urls:
         return posts
-    # Many posts already have groupUrl — leave those alone.
-    # For posts missing it, distribute across chunk_urls proportionally.
-    posts_per_group = max(1, len(posts) // len(chunk_urls)) if chunk_urls else 1
+    posts_per_group = max(1, len(posts) // len(chunk_urls))
     for i, post in enumerate(posts):
         if not post.get("groupUrl") and not post.get("group_url"):
             group_idx = min(i // posts_per_group, len(chunk_urls) - 1)
@@ -77,51 +138,74 @@ def _inject_group_url(posts: list[dict], chunk_urls: list[str]) -> list[dict]:
     return posts
 
 
-def scrape_facebook_groups_progressive(group_urls: list[str]):
-    """
-    Generator — yields (chunk_urls, posts) tuples so the pipeline knows
-    which groups each batch of posts came from.
+def scrape_facebook_groups_progressive(
+    group_urls: list[str],
+    max_posts_per_group: int = DEFAULT_MAX_POSTS_PER_GROUP,
+    scrape_run_id=None,
+    _log_fn=None,
+):
 
-    The chunk_urls are passed back so the pipeline can log group names
-    and the posts are tagged with groupUrl for per-group attribution.
-    """
+    log = _log_fn or print
+
     if not group_urls:
-        print("[FB Groups Scraper] No groups to scrape.")
         return
 
-    for i in range(0, len(group_urls), CHUNK_SIZE):
-        chunk = group_urls[i:i + CHUNK_SIZE]
-        print(f"[FB Groups Scraper] Scraping chunk {i // CHUNK_SIZE + 1}: {len(chunk)} groups")
-        print(f"[FB Groups Scraper] Groups: {chunk}")
+    chunks = [
+        group_urls[i:i + CHUNK_SIZE]
+        for i in range(0, len(group_urls), CHUNK_SIZE)
+    ]
 
+    for chunk_num, chunk in enumerate(chunks, 1):
+
+        # 1. Pre-launch cancel check
+        if _is_cancel_requested(scrape_run_id):
+            log(f"[FB Groups Scraper] Cancel requested — stopping before chunk {chunk_num}")
+            return
+
+        log(
+            f"[FB Groups Scraper] Starting chunk {chunk_num}/{len(chunks)} "
+            f"— {len(chunk)} group(s)"
+        )
+
+        # 2. Launch with post-launch guard
         try:
-            run_id, dataset_id = start_groups_scraper(chunk)
+            result = _launch_and_guard(chunk, max_posts_per_group, scrape_run_id)
         except Exception as e:
-            print(f"[FB Groups Scraper] Failed to start actor for chunk: {e}")
+            log(f"[FB Groups Scraper] Failed to start chunk {chunk_num}: {e}")
             continue
 
+        if result is None:
+            log("[FB Groups Scraper] Cancelled during actor launch — stopping.")
+            return
+
+        run_id, dataset_id = result
+        log(f"[FB Groups Scraper] Actor started (run {run_id}) for chunk {chunk_num}")
+
+        # 3. Poll — actor aborted immediately on cancel
         try:
-            wait_for_run(run_id)
+            wait_for_run(run_id, scrape_run_id=scrape_run_id, log_fn=log)
         except Exception as e:
-            print(f"[FB Groups Scraper] Run ended early ({e}), fetching partial dataset...")
+            log(f"[FB Groups Scraper] Run ended for chunk {chunk_num}: {e}")
             try:
-                partial = fetch_posts(dataset_id)
+                partial = fetch_posts(dataset_id, log_fn=log)
                 if partial:
-                    partial = _inject_group_url(partial, chunk)
-                    yield chunk, partial
-            except Exception as fetch_err:
-                print(f"[FB Groups Scraper] Could not fetch partial dataset: {fetch_err}")
-            continue
+                    log(f"[FB Groups Scraper] Yielding {len(partial)} partial result(s)")
+                    yield chunk, _inject_group_url(partial, chunk)
+            except Exception:
+                pass
+            return  # stop regardless — cancelled or hard failure
 
-        posts = fetch_posts(dataset_id)
+        posts = fetch_posts(dataset_id, log_fn=log)
         if posts:
-            posts = _inject_group_url(posts, chunk)
-            yield chunk, posts
+            yield chunk, _inject_group_url(posts, chunk)
 
 
-def scrape_facebook_groups(group_urls: list[str]) -> list[dict]:
-    """Legacy non-generator version for backwards compat."""
+def scrape_facebook_groups(
+    group_urls: list[str],
+    max_posts_per_group: int = DEFAULT_MAX_POSTS_PER_GROUP,
+) -> list[dict]:
+    """Legacy non-generator wrapper."""
     all_posts = []
-    for _, posts in scrape_facebook_groups_progressive(group_urls):
+    for _, posts in scrape_facebook_groups_progressive(group_urls, max_posts_per_group):
         all_posts.extend(posts)
     return all_posts

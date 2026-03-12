@@ -1,7 +1,7 @@
 SERVICE_CATEGORY_MAP = {
     "cleaning": {
         "label": "Cleaning Services",
-        "craigslist_codes": ["hss", "lbs"],          # household services, labor/skilled
+        "craigslist_codes": ["hss", "lbs"],          
         "facebook_keywords": [
             "house cleaning service",
             "residential cleaning contractor",
@@ -12,7 +12,7 @@ SERVICE_CATEGORY_MAP = {
     },
     "maintenance": {
         "label": "Maintenance & Repair",
-        "craigslist_codes": ["trd", "sks", "aos"],   # skilled trades, general labor, automotive
+        "craigslist_codes": ["trd", "sks", "aos"],   
         "facebook_keywords": [
             "home maintenance contractor",
             "handyman service",
@@ -23,7 +23,7 @@ SERVICE_CATEGORY_MAP = {
     },
     "waste_management": {
         "label": "Waste Management",
-        "craigslist_codes": ["aos", "fgs"],           # general services, farm+garden
+        "craigslist_codes": ["aos", "fgs"],          
         "facebook_keywords": [
             "junk removal service",
             "waste removal contractor",
