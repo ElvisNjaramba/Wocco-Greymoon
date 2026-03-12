@@ -12,6 +12,38 @@ import {
 
 const API = "http://127.0.0.1:8000/api";
 
+// ── Nominatim geocoder for FB leads ──────────────────────────────────────────
+// Caches results in module scope to survive re-renders; rate-limited to 1 req/s
+const _geocodeCache = {};
+let _lastGeoReq = 0;
+
+async function geocodeLocation(locationStr) {
+  if (!locationStr) return null;
+  const key = locationStr.toLowerCase().trim();
+  if (_geocodeCache[key] !== undefined) return _geocodeCache[key];
+
+  // Rate-limit: at least 1100ms between requests
+  const now = Date.now();
+  const wait = Math.max(0, _lastGeoReq + 1100 - now);
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  _lastGeoReq = Date.now();
+
+  try {
+    const resp = await fetch(
+      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(locationStr)}&format=json&limit=1`,
+      { headers: { "Accept-Language": "en" } }
+    );
+    const data = await resp.json();
+    if (data && data[0]) {
+      const result = { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+      _geocodeCache[key] = result;
+      return result;
+    }
+  } catch (_) {}
+  _geocodeCache[key] = null; // cache misses too
+  return null;
+}
+
 const SERVICE_TAXONOMY = {
   "Cleaning": {
     services: [
@@ -133,6 +165,20 @@ const SourceTag = ({ source }) => (
     : <span className="inline-flex items-center gap-1 text-[9px] font-bold uppercase px-2 py-0.5 rounded border bg-orange-500/10 text-orange-400 border-orange-500/20">CL</span>
 );
 
+// ── New-lead toast banner ─────────────────────────────────────────────────────
+function NewLeadsBanner({ count, onView }) {
+  if (count === 0) return null;
+  return (
+    <div className="fixed top-[72px] left-1/2 -translate-x-1/2 z-[1000] animate-bounce-once">
+      <button onClick={onView}
+        className="flex items-center gap-2 px-4 py-2.5 rounded-full bg-emerald-500 text-white text-xs font-bold shadow-xl shadow-emerald-500/30 hover:bg-emerald-400 transition-colors">
+        <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
+        {count} new lead{count !== 1 ? "s" : ""} arrived — click to view
+      </button>
+    </div>
+  );
+}
+
 // ── Map auto-fit ──────────────────────────────────────────────────────────────
 function MapAutoFit({ leads }) {
   const map = useMap();
@@ -206,10 +252,10 @@ function ActivityPanel({ scrapeStatus, visible }) {
 }
 
 // ── Live scrape dashboard ─────────────────────────────────────────────────────
-function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting }) {
+function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, newLeadsBuffer }) {
   const logRef = useRef(null);
   const log = scrapeStatus?.activity_log || [];
-  const currentStage = scrapeStatus?.current_stage || "Initialising…";
+  const currentStage = scrapeStatus?.current_stage || "Initialising...";
   const stageDetail = scrapeStatus?.stage_detail || "";
   const saved = scrapeStatus?.leads_collected || 0;
   const skipped = scrapeStatus?.leads_skipped || 0;
@@ -300,7 +346,7 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting }) {
               <button onClick={onStop} disabled={isAborting}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-semibold hover:bg-red-500/20 transition-all disabled:opacity-40">
                 <X className="w-3 h-3" />
-                <span className="hidden sm:inline">{isAborting ? "Stopping…" : "Stop"}</span>
+                <span className="hidden sm:inline">{isAborting ? "Stopping..." : "Stop"}</span>
               </button>
             </div>
           </div>
@@ -349,12 +395,12 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting }) {
             </div>
           )}
 
-          {/* Counters */}
+          {/* Counters — now includes live lead count from actual DB */}
           <div className="grid grid-cols-3 gap-2">
             <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl px-3 py-2.5">
               <div className="text-[9px] text-white/25 uppercase tracking-widest mb-1">Leads saved</div>
-              <div className="text-xl font-bold tabular-nums text-emerald-400">{saved}</div>
-              {saved > 0 && <div className="text-[9px] text-emerald-400/40 mt-0.5">↑ live</div>}
+              <div className="text-xl font-bold tabular-nums text-emerald-400">{liveLeadCount ?? saved}</div>
+              {(liveLeadCount ?? saved) > 0 && <div className="text-[9px] text-emerald-400/40 mt-0.5 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />live</div>}
             </div>
             <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl px-3 py-2.5">
               <div className="text-[9px] text-white/25 uppercase tracking-widest mb-1">Duplicates</div>
@@ -365,6 +411,31 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting }) {
               <div className="text-xl font-bold tabular-nums text-white/35">{log.length}</div>
             </div>
           </div>
+
+          {/* ── Live lead stream preview ── */}
+          {newLeadsBuffer && newLeadsBuffer.length > 0 && (
+            <div className="mt-3 border border-emerald-500/15 rounded-xl overflow-hidden">
+              <div className="px-3 py-2 bg-emerald-500/5 border-b border-emerald-500/10 flex items-center gap-2">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                <span className="text-[10px] font-semibold text-emerald-400 uppercase tracking-widest">Latest incoming leads</span>
+              </div>
+              <div className="divide-y divide-white/[0.04] max-h-36 overflow-y-auto">
+                {newLeadsBuffer.slice(0, 5).map(lead => (
+                  <div key={lead.post_id} className="px-3 py-2 flex items-start gap-2">
+                    <SourceTag source={lead.source} />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-[11px] text-white/70 font-medium truncate">{lead.title}</p>
+                      {lead.location && <p className="text-[10px] text-white/30 mt-0.5 flex items-center gap-1"><MapPin className="w-2.5 h-2.5" />{lead.location}</p>}
+                    </div>
+                    {lead.phone && <Phone className="w-3 h-3 text-emerald-400/60 flex-shrink-0 mt-0.5" />}
+                  </div>
+                ))}
+                {newLeadsBuffer.length > 5 && (
+                  <div className="px-3 py-1.5 text-[10px] text-white/25 text-center">+{newLeadsBuffer.length - 5} more</div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -381,7 +452,7 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting }) {
             <div className="p-2 max-h-56 overflow-y-auto divide-y divide-white/[0.03]">
               {fbLogs.length === 0 ? (
                 <div className="py-8 text-center text-white/15 text-xs">
-                  {fbStarted ? "Collecting group data…" : "Waiting for Facebook phase…"}
+                  {fbStarted ? "Collecting group data..." : "Waiting for Facebook phase..."}
                 </div>
               ) : (
                 fbLogs.map((entry, i) => {
@@ -417,7 +488,7 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting }) {
             {log.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center gap-3 text-white/20">
                 <Loader className="w-5 h-5 animate-spin" />
-                <span className="text-xs">Waiting for first pipeline event…</span>
+                <span className="text-xs">Waiting for first pipeline event...</span>
               </div>
             ) : (
               log.map((entry, i) => {
@@ -464,7 +535,7 @@ const FacebookLeadCard = ({ lead, onSelect, updateStatus }) => {
   const comments = lead.raw_json?.commentsCount || 0;
   const shares = lead.raw_json?.sharesCount || 0;
   const authorName = lead.raw_json?.authorName || lead.raw_json?.author || "";
-  const snippet = (lead.post || "").slice(0, 200) + ((lead.post || "").length > 200 ? "…" : "");
+  const snippet = (lead.post || "").slice(0, 200) + ((lead.post || "").length > 200 ? "..." : "");
   return (
     <div className="bg-white/[0.02] border border-white/[0.06] rounded-2xl p-3 lg:p-4 hover:bg-white/[0.04] hover:border-indigo-500/20 transition-all group cursor-pointer"
       onClick={() => onSelect(lead)}>
@@ -609,14 +680,14 @@ function Pagination({ page, totalPages, total, perPage, onPage }) {
       <div className="flex items-center gap-1 flex-wrap justify-center order-1 sm:order-2">
         <button onClick={() => onPage(1)} disabled={page === 1} className="px-2.5 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">«</button>
         <button onClick={() => onPage(page - 1)} disabled={page === 1} className="px-2.5 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">‹</button>
-        {pages[0] > 1 && <span className="px-1.5 text-white/20 text-xs">…</span>}
+        {pages[0] > 1 && <span className="px-1.5 text-white/20 text-xs">...</span>}
         {pages.map(p => (
           <button key={p} onClick={() => onPage(p)}
             className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${page === p ? "bg-blue-600 text-white" : "bg-white/5 text-white/40 hover:text-white"}`}>
             {p}
           </button>
         ))}
-        {pages[pages.length - 1] < totalPages && <span className="px-1.5 text-white/20 text-xs">…</span>}
+        {pages[pages.length - 1] < totalPages && <span className="px-1.5 text-white/20 text-xs">...</span>}
         <button onClick={() => onPage(page + 1)} disabled={page === totalPages} className="px-2.5 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">›</button>
         <button onClick={() => onPage(totalPages)} disabled={page === totalPages} className="px-2.5 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">»</button>
       </div>
@@ -703,6 +774,19 @@ export default function Services() {
   const [totalLeads, setTotalLeads] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
 
+  // ── NEW: real-time lead streaming state ──────────────────────────────────
+  // Tracks the created_at of the newest lead we've fetched so far.
+  // During active scrapes we poll for leads newer than this and prepend them.
+  const newestLeadTs = useRef(null);
+  const [newLeadsBuffer, setNewLeadsBuffer] = useState([]); // leads received mid-scrape
+  const [pendingNewCount, setPendingNewCount] = useState(0); // banner count
+  const liveLeadCountRef = useRef(0); // accurate count for dashboard
+
+  // ── NEW: geocoded FB lead coords ─────────────────────────────────────────
+  // Map of post_id → {lat, lng} for FB leads geocoded from location string
+  const [fbGeoCoords, setFbGeoCoords] = useState({});
+  const geocodingQueue = useRef(new Set());
+
   const fetchLeads = useCallback(async (pageNum = 1) => {
     setLoading(true);
     try {
@@ -717,18 +801,96 @@ export default function Services() {
       if (fFbGroupDebounced) params.fb_group = fFbGroupDebounced;
       const res = await axios.get(`${API}/leads/`, { headers, params });
       const data = res.data;
-      if (Array.isArray(data)) {
-        setLeads(data);
-        setTotalLeads(data.length);
-        setTotalPages(1);
-      } else {
-        setLeads(data.results ?? []);
-        setTotalLeads(data.total ?? 0);
-        setTotalPages(data.total_pages ?? 1);
+      const results = Array.isArray(data) ? data : (data.results ?? []);
+
+      setLeads(results);
+      setTotalLeads(Array.isArray(data) ? data.length : (data.total ?? 0));
+      setTotalPages(Array.isArray(data) ? 1 : (data.total_pages ?? 1));
+
+      // Track newest lead timestamp
+      if (results.length > 0) {
+        const newest = results.reduce((a, b) =>
+          new Date(a.created_at) > new Date(b.created_at) ? a : b
+        );
+        newestLeadTs.current = newest.created_at;
+        liveLeadCountRef.current = Array.isArray(data) ? data.length : (data.total ?? 0);
       }
+
+      // Clear new leads buffer once we do a full refresh
+      setNewLeadsBuffer([]);
+      setPendingNewCount(0);
     } catch (e) { console.error(e); }
     setLoading(false);
   }, [headers, fSource, fServiceCat, fStatus, fMinScore, fSearchDebounced, fHasPhone, fHasEmail, fFbGroupDebounced]);
+
+  // ── NEW: fetch only leads newer than our latest timestamp ─────────────────
+  const fetchNewLeadsOnly = useCallback(async () => {
+    if (!newestLeadTs.current) {
+      // No baseline yet — do a full fetch
+      await fetchLeads(1);
+      return;
+    }
+    try {
+      const params = {
+        page: 1,
+        page_size: 50,
+        date_after: newestLeadTs.current,
+        ordering: "-created_at",
+      };
+      if (fSource) params.source = fSource;
+      if (fServiceCat) params.service_category = fServiceCat;
+      const res = await axios.get(`${API}/leads/`, { headers, params });
+      const data = res.data;
+      const results = Array.isArray(data) ? data : (data.results ?? []);
+
+      if (results.length > 0) {
+        // Update the newest timestamp
+        const newest = results.reduce((a, b) =>
+          new Date(a.created_at) > new Date(b.created_at) ? a : b
+        );
+        newestLeadTs.current = newest.created_at;
+
+        // Prepend to main leads list (dedup by post_id)
+        setLeads(prev => {
+          const existingIds = new Set(prev.map(l => l.post_id));
+          const truly_new = results.filter(l => !existingIds.has(l.post_id));
+          if (truly_new.length === 0) return prev;
+          liveLeadCountRef.current += truly_new.length;
+          setTotalLeads(t => t + truly_new.length);
+          // Update new leads buffer for the dashboard preview
+          setNewLeadsBuffer(buf => [...truly_new, ...buf].slice(0, 20));
+          setPendingNewCount(c => c + truly_new.length);
+          return [...truly_new, ...prev];
+        });
+      }
+    } catch (e) { console.error(e); }
+  }, [headers, fSource, fServiceCat, fetchLeads]);
+
+  // ── NEW: geocode FB leads when they arrive or when map tab is opened ──────
+  const geocodeFbLeads = useCallback(async (leadsToGeocode) => {
+    const fbLeadsNeedingGeo = leadsToGeocode.filter(l =>
+      l.source === "FACEBOOK" &&
+      !l.latitude &&
+      !l.longitude &&
+      l.location &&
+      !geocodingQueue.current.has(l.post_id) &&
+      fbGeoCoords[l.post_id] === undefined
+    );
+
+    if (fbLeadsNeedingGeo.length === 0) return;
+
+    // Mark as queued
+    fbLeadsNeedingGeo.forEach(l => geocodingQueue.current.add(l.post_id));
+
+    // Process sequentially (rate-limited by geocodeLocation itself)
+    for (const lead of fbLeadsNeedingGeo.slice(0, 30)) { // cap at 30 per call
+      const coords = await geocodeLocation(lead.location);
+      geocodingQueue.current.delete(lead.post_id);
+      if (coords) {
+        setFbGeoCoords(prev => ({ ...prev, [lead.post_id]: coords }));
+      }
+    }
+  }, [fbGeoCoords]);
 
   const fetchCategories = useCallback(async () => {
     try { const res = await axios.get(`${API}/meta/categories/`); setCategories(res.data.categories); } catch (e) {}
@@ -787,17 +949,24 @@ export default function Services() {
     setPage(1); fetchLeads(1);
   }, [fSource, fServiceCat, fStatus, fMinScore, fSearchDebounced, fHasPhone, fHasEmail, fFbGroupDebounced]);
 
+  // ── MODIFIED: polling now uses fetchNewLeadsOnly during scrapes ───────────
   useEffect(() => {
     if (!scraping) return;
     const iv = setInterval(() => {
       checkScrapeStatus();
       fetchHistory();
-      if (Date.now() - lastTypedRef.current > 1000) {
-        fetchLeads();
-      }
+      // Always fetch new leads during scrape, regardless of typing activity
+      fetchNewLeadsOnly();
     }, 3000);
     return () => clearInterval(iv);
-  }, [scraping, checkScrapeStatus, fetchHistory, fetchLeads]);
+  }, [scraping, checkScrapeStatus, fetchHistory, fetchNewLeadsOnly]);
+
+  // ── Geocode FB leads when map tab is opened or leads change ──────────────
+  useEffect(() => {
+    if (activeTab === "map" && leads.length > 0) {
+      geocodeFbLeads(leads);
+    }
+  }, [activeTab, leads, geocodeFbLeads]);
 
   useEffect(() => {
     if (!locationValue.trim()) {
@@ -828,6 +997,10 @@ export default function Services() {
     if (!locationValue.trim() && !fbOnlyCustom) return alert("Enter a location.");
     if (selectedSources.length === 0) return alert("Select at least one source.");
     setScraping(true); setScrapeStatus(null); setSidebarOpen(false);
+    // Reset real-time tracking for new run
+    newestLeadTs.current = null;
+    setNewLeadsBuffer([]);
+    setPendingNewCount(0);
     try {
       const res = await axios.post(`${API}/scrape/start/`, {
         location: { type: locationType, value: locationValue.trim() },
@@ -837,7 +1010,6 @@ export default function Services() {
         max_posts_per_group: maxPostsPerGroup,
         sources: selectedSources,
         fb_custom_keywords: fbCustomKeywords.trim() ? fbCustomKeywords.split(",").map(k => k.trim()).filter(Boolean) : undefined,
-        // ✅ Fixed: use \n escape instead of literal newline in regex
         fb_group_urls: fbManualGroupUrls.trim() ? fbManualGroupUrls.split(/[\n,]+/).map(u => u.trim()).filter(u => u.startsWith("http")) : undefined,
       }, { headers });
       setRunId(res.data.run_id); fetchHistory(); fetchScrapedGroups(); setTimeout(checkScrapeStatus, 800);
@@ -867,10 +1039,35 @@ export default function Services() {
   }, [leads, fServiceLabel]);
 
   const paginated = filtered;
-  const mapLeads = filtered.filter(l => l.latitude && l.longitude);
+
+  // ── MODIFIED: mapLeads now includes geocoded FB leads ─────────────────────
+  const mapLeads = useMemo(() => {
+    return filtered.map(l => {
+      if (l.latitude && l.longitude) return l;
+      // Attach geocoded coords for FB leads
+      if (l.source === "FACEBOOK" && fbGeoCoords[l.post_id]) {
+        return {
+          ...l,
+          latitude: fbGeoCoords[l.post_id].lat.toString(),
+          longitude: fbGeoCoords[l.post_id].lng.toString(),
+          _geocoded: true,
+        };
+      }
+      return null;
+    }).filter(Boolean);
+  }, [filtered, fbGeoCoords]);
+
   const fbLeads = paginated.filter(l => l.source === "FACEBOOK");
   const clLeads = paginated.filter(l => l.source === "CRAIGSLIST");
   const hasMixed = fbLeads.length > 0 && clLeads.length > 0;
+
+  // Count FB leads that have or will have coords
+  const fbGeocodedCount = leads.filter(l =>
+    l.source === "FACEBOOK" && (l.latitude || fbGeoCoords[l.post_id])
+  ).length;
+  const fbPendingGeoCount = leads.filter(l =>
+    l.source === "FACEBOOK" && !l.latitude && !fbGeoCoords[l.post_id] && l.location
+  ).length;
 
   const stats = useMemo(() => ({
     total: totalLeads,
@@ -966,7 +1163,7 @@ export default function Services() {
                 }}
                 onChange={e => { lastTypedRef.current = Date.now(); setLocationValue(e.target.value); }}
                 onBlur={() => setTimeout(() => setSuggestions(s => ({ ...s, show: false })), 180)}
-                placeholder={locationType === "city" ? "Search or select a city…" : locationType === "state" ? "Search or select a state…" : "e.g. 77001"}
+                placeholder={locationType === "city" ? "Search or select a city..." : locationType === "state" ? "Search or select a state..." : "e.g. 77001"}
                 className="w-full bg-white/5 border border-white/10 rounded-xl pl-9 pr-4 py-2.5 text-sm text-white placeholder-white/20 focus:outline-none focus:border-blue-500/60 transition-all"
               />
             </div>
@@ -1116,7 +1313,7 @@ export default function Services() {
                   value={fbManualGroupUrls}
                   autoComplete="off" spellCheck="false"
                   onChange={e => { lastTypedRef.current = Date.now(); setFbManualGroupUrls(e.target.value); }}
-                  placeholder={"https://www.facebook.com/groups/…\nOne URL per line"}
+                  placeholder={"https://www.facebook.com/groups/...\nOne URL per line"}
                   rows={3}
                   className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-xs text-white placeholder-white/20 focus:outline-none focus:border-indigo-500/60 transition-all resize-none leading-relaxed font-mono"
                 />
@@ -1142,7 +1339,7 @@ export default function Services() {
                 <div className="h-full bg-gradient-to-r from-blue-500 to-violet-500 animate-pulse rounded-full w-2/3" />
               </div>
               <div className="flex gap-2">
-                <div className="flex-1 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs font-semibold text-center">{isAborting ? "Stopping…" : "Running…"}</div>
+                <div className="flex-1 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs font-semibold text-center">{isAborting ? "Stopping..." : "Running..."}</div>
                 <button onClick={cancelScrape} disabled={isAborting}
                   className="px-4 py-2.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-semibold hover:bg-red-500/20 transition-all disabled:opacity-50">Stop</button>
               </div>
@@ -1172,7 +1369,7 @@ export default function Services() {
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-white/30 pointer-events-none" />
             <input
               type="text"
-              placeholder="Search title or location…"
+              placeholder="Search title or location..."
               value={fSearch}
               autoComplete="off" autoCorrect="off" spellCheck="false"
               onChange={e => { lastTypedRef.current = Date.now(); setFSearch(e.target.value); }}
@@ -1251,7 +1448,7 @@ export default function Services() {
                 type="text"
                 value={fFbGroup}
                 onChange={e => { lastTypedRef.current = Date.now(); setFFbGroup(e.target.value); }}
-                placeholder="Group name…"
+                placeholder="Group name..."
                 autoComplete="off" autoCorrect="off" spellCheck="false"
                 className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-white placeholder-white/20 focus:outline-none focus:border-blue-500/50 transition-all"
               />
@@ -1265,6 +1462,18 @@ export default function Services() {
   return (
     <div style={{ fontFamily: "'DM Sans', 'Helvetica Neue', sans-serif" }} className="min-h-screen bg-[#0f1117] text-slate-100">
       <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');`}</style>
+
+      {/* ── NEW: New leads banner (shown while scraping) ─────── */}
+      {scraping && pendingNewCount > 0 && (
+        <NewLeadsBanner
+          count={pendingNewCount}
+          onView={() => {
+            setPendingNewCount(0);
+            setActiveTab("leads");
+            window.scrollTo({ top: 0, behavior: "smooth" });
+          }}
+        />
+      )}
 
       {/* Mobile drawer */}
       {sidebarOpen && (
@@ -1297,11 +1506,12 @@ export default function Services() {
                 <div className="flex items-center gap-2">
                   <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full border text-xs font-semibold ${isAborting ? "bg-red-500/10 border-red-500/20 text-red-400" : navSrc === "craigslist" ? "bg-orange-500/10 border-orange-500/25 text-orange-400" : navSrc === "facebook" ? "bg-indigo-500/10 border-indigo-500/25 text-indigo-400" : "bg-amber-500/10 border-amber-500/20 text-amber-400"}`}>
                     <Loader className="w-3 h-3 animate-spin" />
-                    <span className="hidden sm:inline">{isAborting ? "Stopping…" : navSrc === "craigslist" ? "🔶 Craigslist" : navSrc === "facebook" ? "🔷 Facebook" : "Running…"}</span>
+                    <span className="hidden sm:inline">{isAborting ? "Stopping..." : navSrc === "craigslist" ? "🔶 Craigslist" : navSrc === "facebook" ? "🔷 Facebook" : "Running..."}</span>
                   </div>
-                  {(scrapeStatus?.leads_collected > 0) && (
+                  {/* Live lead count badge */}
+                  {totalLeads > 0 && (
                     <span className="hidden sm:flex items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-bold px-2.5 py-1 rounded-full">
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />{scrapeStatus.leads_collected}
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />{totalLeads}
                     </span>
                   )}
                 </div>
@@ -1323,7 +1533,46 @@ export default function Services() {
         {/* Main */}
         <main className="space-y-4 min-w-0">
           {scraping && scrapeStatus && (
-            <ScrapeLiveDashboard scrapeStatus={scrapeStatus} onStop={cancelScrape} isAborting={isAborting} />
+            <ScrapeLiveDashboard
+              scrapeStatus={scrapeStatus}
+              onStop={cancelScrape}
+              isAborting={isAborting}
+              liveLeadCount={totalLeads}
+              newLeadsBuffer={newLeadsBuffer}
+            />
+          )}
+
+          {/* ── Live leads section shown while scraping ── */}
+          {scraping && leads.length > 0 && (
+            <div className="bg-white/[0.02] border border-white/[0.06] rounded-2xl overflow-hidden">
+              <div className="px-4 py-3 border-b border-white/[0.06] flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span className="text-xs font-semibold text-white/60">Leads — updating live</span>
+                <span className="text-[11px] text-white/25 ml-auto">{totalLeads} total</span>
+              </div>
+              <div className="divide-y divide-white/[0.04] max-h-[400px] overflow-y-auto">
+                {leads.slice(0, 20).map(lead => (
+                  <div key={lead.post_id}
+                    className="px-4 py-3 flex items-start gap-3 hover:bg-white/[0.02] cursor-pointer transition-colors"
+                    onClick={() => setSelectedLead(lead)}>
+                    <SourceTag source={lead.source} />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-white/75 truncate">{lead.title}</p>
+                      <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                        {lead.location && <span className="text-[10px] text-white/30 flex items-center gap-0.5"><MapPin className="w-2.5 h-2.5" />{lead.location}</span>}
+                        {lead.phone && <span className="text-[10px] text-emerald-400/70 flex items-center gap-0.5"><Phone className="w-2.5 h-2.5" />{lead.phone}</span>}
+                      </div>
+                    </div>
+                    <ScoreDot score={lead.score} />
+                  </div>
+                ))}
+                {leads.length > 20 && (
+                  <div className="px-4 py-2.5 text-center text-[10px] text-white/20">
+                    +{leads.length - 20} more — stop scrape to view all with filters
+                  </div>
+                )}
+              </div>
+            </div>
           )}
 
           {!scraping && (<>
@@ -1381,7 +1630,7 @@ export default function Services() {
                 {loading ? (
                   <div className="py-24 flex flex-col items-center gap-3 bg-white/[0.03] border border-white/[0.06] rounded-2xl">
                     <Loader className="w-6 h-6 text-white/20 animate-spin" />
-                    <span className="text-white/20 text-sm">Loading leads…</span>
+                    <span className="text-white/20 text-sm">Loading leads...</span>
                   </div>
                 ) : paginated.length === 0 ? (
                   <div className="py-24 flex flex-col items-center gap-3 bg-white/[0.03] border border-white/[0.06] rounded-2xl">
@@ -1559,21 +1808,44 @@ export default function Services() {
                   <div className="flex items-center gap-3">
                     <span className="text-sm font-semibold">Lead Locations</span>
                     <span className="text-[11px] text-white/30">{mapLeads.length} mapped</span>
+                    {/* NEW: geocoding status indicator */}
+                    {fbPendingGeoCount > 0 && (
+                      <span className="flex items-center gap-1.5 text-[10px] text-indigo-400/60">
+                        <Loader className="w-3 h-3 animate-spin" />
+                        Geocoding {fbPendingGeoCount} FB leads...
+                      </span>
+                    )}
                   </div>
-                  <div className="flex items-center gap-4 text-[11px] text-white/30">
+                  <div className="flex items-center gap-4 text-[11px] text-white/30 flex-wrap">
                     {mapLeads.filter(l => l.source === "CRAIGSLIST").length > 0 && (
                       <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-orange-400" />CL: {mapLeads.filter(l => l.source === "CRAIGSLIST").length}</span>
                     )}
                     {mapLeads.filter(l => l.source === "FACEBOOK").length > 0 && (
-                      <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-indigo-400" />FB: {mapLeads.filter(l => l.source === "FACEBOOK").length}</span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-indigo-400" />
+                        FB: {mapLeads.filter(l => l.source === "FACEBOOK").length}
+                        {mapLeads.filter(l => l.source === "FACEBOOK" && l._geocoded).length > 0 && (
+                          <span className="text-indigo-400/40">(incl. {mapLeads.filter(l => l._geocoded).length} geocoded)</span>
+                        )}
+                      </span>
                     )}
                   </div>
                 </div>
+                {/* Note about geocoding */}
+                {leads.filter(l => l.source === "FACEBOOK").length > 0 && (
+                  <div className="px-4 py-2 bg-indigo-500/5 border-b border-indigo-500/10 text-[10px] text-indigo-400/60 flex items-center gap-2">
+                    <Info className="w-3 h-3 flex-shrink-0" />
+                    Facebook leads are geocoded from their location text using OpenStreetMap — accuracy varies. Craigslist leads use precise GPS coordinates.
+                  </div>
+                )}
                 <div className="h-[380px] lg:h-[540px]">
                   {mapLeads.length === 0 ? (
                     <div className="h-full flex flex-col items-center justify-center text-white/20 gap-3">
                       <MapPin className="w-8 h-8 text-white/10" />
                       <span className="text-sm">No leads with location data yet</span>
+                      {leads.filter(l => l.source === "FACEBOOK" && l.location).length > 0 && (
+                        <span className="text-xs text-indigo-400/40">Geocoding {leads.filter(l => l.source === "FACEBOOK" && l.location).length} FB leads from location text...</span>
+                      )}
                     </div>
                   ) : (
                     <MapContainer center={[37.8, -96]} zoom={4} minZoom={3} maxZoom={16}
@@ -1582,6 +1854,7 @@ export default function Services() {
                       <MapAutoFit leads={mapLeads} />
                       {mapLeads.map(lead => {
                         const isFB = lead.source === "FACEBOOK";
+                        const isGeocoded = lead._geocoded;
                         return (
                           <Marker key={lead.post_id}
                             position={[parseFloat(lead.latitude), parseFloat(lead.longitude)]}
@@ -1590,9 +1863,16 @@ export default function Services() {
                               <div className="text-xs min-w-[160px]">
                                 <div className={`font-bold mb-1 ${isFB ? "text-indigo-600" : "text-orange-600"}`}>
                                   {isFB ? "🔷 Facebook" : "🔶 Craigslist"}
+                                  {isGeocoded && <span className="text-[10px] font-normal text-gray-400 ml-1">(geocoded)</span>}
                                 </div>
                                 <div className="font-semibold text-gray-800">{lead.title?.slice(0, 55)}</div>
                                 <div className="text-gray-500 text-[11px] mt-0.5">{lead.location}</div>
+                                {isFB && (lead.fb_group_name || lead.raw_json?.groupName) && (
+                                  <div className="text-indigo-500 text-[10px] mt-0.5 flex items-center gap-1">
+                                    <Users style={{ width: 10, height: 10 }} />
+                                    {lead.fb_group_name || lead.raw_json?.groupName}
+                                  </div>
+                                )}
                                 {lead.phone && <div className="text-emerald-600 text-[11px] mt-0.5">📞 {lead.phone}</div>}
                                 {lead.score && <div className="text-gray-400 text-[10px] mt-0.5">Score: {lead.score}</div>}
                               </div>
@@ -1709,7 +1989,7 @@ export default function Services() {
                   { label: "Phone",    value: selectedLead.phone || "---", highlight: !!selectedLead.phone },
                   { label: "Email",    value: selectedLead.email || "---", highlight: !!selectedLead.email },
                   { label: "Posted",   value: selectedLead.datetime ? new Date(selectedLead.datetime).toLocaleDateString() : "---" },
-                  { label: "Post ID",  value: (selectedLead.post_id || "").slice(0, 16) + "…" },
+                  { label: "Post ID",  value: (selectedLead.post_id || "").slice(0, 16) + "..." },
                 ].map(({ label, value, highlight }) => (
                   <div key={label} className="bg-white/[0.03] rounded-xl p-3">
                     <div className="text-[10px] text-white/25 uppercase tracking-widest mb-0.5">{label}</div>
