@@ -142,6 +142,87 @@ def _save_lead_batch(normalized_items, stats, scrape_run_id=None):
             stats["errors"].append(f"Save error: {str(e)[:100]}")
 
 
+# ── FB batch processor — saves a chunk of FB posts immediately ─
+# Extracted so it can be called both from the normal loop
+# AND from the cancellation/partial-result path.
+
+def _process_and_save_fb_batch(
+    chunk_urls,
+    fb_batch,
+    categories,
+    location_data,
+    zip_code,
+    stats,
+    scrape_run_id,
+    group_name_map,
+    chunk_num,
+    total_chunks,
+    svc_log,
+):
+    from base.models import ScrapedFbGroup, ScrapedFbPost
+
+    chunk_names = ", ".join(group_name_map.get(u, u) for u in chunk_urls[:3])
+    if len(chunk_urls) > 3:
+        chunk_names += f" (+{len(chunk_urls)-3})"
+
+    _log(scrape_run_id,
+         f"Facebook — chunk {chunk_num}/{total_chunks}",
+         f"Groups: {chunk_names} — {len(fb_batch)} post(s). Deduping + saving...")
+
+    # Post-level dedup
+    post_urls_in_batch = [
+        item.get("url") or item.get("postUrl") or item.get("link") or ""
+        for item in fb_batch
+    ]
+    already_seen = set(
+        ScrapedFbPost.objects.filter(
+            post_url__in=[u for u in post_urls_in_batch if u]
+        ).values_list("post_url", flat=True)
+    )
+    fresh_items = [
+        item for item, url in zip(fb_batch, post_urls_in_batch)
+        if not url or url not in already_seen
+    ]
+    dupe_count = len(fb_batch) - len(fresh_items)
+    if dupe_count:
+        _log(scrape_run_id,
+             f"Facebook — post dedup (chunk {chunk_num})",
+             f"{dupe_count} already saved — skipped. "
+             f"{len(fresh_items)} new post(s) to process.",
+             level="info")
+
+    normalized = [
+        normalize_facebook(
+            item,
+            categories[0] if categories else "general",
+            location_data["display"] if location_data else "",
+            zip_code=zip_code,
+        )
+        for item in fresh_items
+    ]
+    _save_lead_batch(normalized, stats, scrape_run_id)
+
+    # Record post URLs so they're skipped on future runs
+    new_post_records = []
+    for item, url in zip(fb_batch, post_urls_in_batch):
+        if url and url not in already_seen:
+            group_url_for_post = (
+                item.get("groupUrl") or item.get("group_url")
+                or (chunk_urls[0] if chunk_urls else "")
+            )
+            new_post_records.append(
+                ScrapedFbPost(post_url=url, group_url=group_url_for_post)
+            )
+    if new_post_records:
+        ScrapedFbPost.objects.bulk_create(new_post_records, ignore_conflicts=True)
+
+    _log(scrape_run_id,
+         f"Facebook — chunk {chunk_num} saved",
+         f"{len(normalized)} new post(s) saved — "
+         f"{stats['leads_saved']} total, {stats['leads_skipped']} duplicate(s).",
+         level="success")
+
+
 # ── Main pipeline ─────────────────────────────────────────────
 
 def run_pipeline(
@@ -203,7 +284,7 @@ def run_pipeline(
         try:
             for batch_items in scrape_craigslist_progressive(
                 cl_cities, cl_codes,
-                scrape_run_id=scrape_run_id,   # ← cancel-aware
+                scrape_run_id=scrape_run_id,
                 _log_fn=svc_log,
             ):
                 batch_num += 1
@@ -272,7 +353,7 @@ def run_pipeline(
                     fb_keywords,
                     fb_location,
                     max_groups=max_groups,
-                    scrape_run_id=scrape_run_id,   # ← cancel-aware
+                    scrape_run_id=scrape_run_id,
                     _log_fn=svc_log,
                 )
 
@@ -331,82 +412,44 @@ def run_pipeline(
                 total_chunks = -(-len(discovered_urls) // chunk_size)
                 chunk_num    = 0
 
+                # ── KEY FIX: iterate the generator and save every
+                #    batch immediately — including partial batches
+                #    yielded on cancellation/error.  The generator
+                #    never raises; it yields partial data then
+                #    returns, so we just need to process everything
+                #    that comes out of it regardless of why it stops.
                 for chunk_urls, fb_batch in scrape_facebook_groups_progressive(
                     discovered_urls,
                     max_posts_per_group=max_posts_per_group,
-                    scrape_run_id=scrape_run_id,   # ← cancel-aware
+                    scrape_run_id=scrape_run_id,
                     _log_fn=svc_log,
                 ):
+                    chunk_num += 1
+
+                    # Save immediately — before any further cancel checks
+                    _process_and_save_fb_batch(
+                        chunk_urls=chunk_urls,
+                        fb_batch=fb_batch,
+                        categories=categories,
+                        location_data=location_data,
+                        zip_code=zip_code,
+                        stats=stats,
+                        scrape_run_id=scrape_run_id,
+                        group_name_map=group_name_map,
+                        chunk_num=chunk_num,
+                        total_chunks=total_chunks,
+                        svc_log=svc_log,
+                    )
+
+                    # Check cancellation AFTER saving — never before
                     if _cancelled(scrape_run_id):
+                        _log(scrape_run_id, "Facebook — cancelled",
+                             f"Cancelled after saving chunk {chunk_num}. "
+                             f"{stats['leads_saved']} lead(s) saved so far.",
+                             level="warning")
                         break
 
-                    chunk_num += 1
-                    chunk_names = ", ".join(
-                        group_name_map.get(u, u) for u in chunk_urls[:3]
-                    )
-                    if len(chunk_urls) > 3:
-                        chunk_names += f" (+{len(chunk_urls)-3})"
-
-                    _log(scrape_run_id,
-                         f"Facebook — chunk {chunk_num}/{total_chunks}",
-                         f"Groups: {chunk_names} — {len(fb_batch)} post(s). Deduping + saving...")
-
-                    # Post-level dedup
-                    post_urls_in_batch = [
-                        item.get("url") or item.get("postUrl") or item.get("link") or ""
-                        for item in fb_batch
-                    ]
-                    already_seen = set(
-                        ScrapedFbPost.objects.filter(
-                            post_url__in=[u for u in post_urls_in_batch if u]
-                        ).values_list("post_url", flat=True)
-                    )
-                    fresh_items = [
-                        item for item, url in zip(fb_batch, post_urls_in_batch)
-                        if not url or url not in already_seen
-                    ]
-                    dupe_count = len(fb_batch) - len(fresh_items)
-                    if dupe_count:
-                        _log(scrape_run_id,
-                             f"Facebook — post dedup (chunk {chunk_num})",
-                             f"{dupe_count} already saved — skipped. "
-                             f"{len(fresh_items)} new post(s) to process.",
-                             level="info")
-
-                    normalized = [
-                        normalize_facebook(
-                            item,
-                            categories[0] if categories else "general",
-                            location_data["display"] if location_data else "",
-                            zip_code=zip_code,
-                        )
-                        for item in fresh_items
-                    ]
-                    _save_lead_batch(normalized, stats, scrape_run_id)
-
-                    # Record post URLs so they're skipped on future runs
-                    new_post_records = []
-                    for item, url in zip(fb_batch, post_urls_in_batch):
-                        if url and url not in already_seen:
-                            group_url_for_post = (
-                                item.get("groupUrl") or item.get("group_url")
-                                or (chunk_urls[0] if chunk_urls else "")
-                            )
-                            new_post_records.append(
-                                ScrapedFbPost(post_url=url, group_url=group_url_for_post)
-                            )
-                    if new_post_records:
-                        ScrapedFbPost.objects.bulk_create(
-                            new_post_records, ignore_conflicts=True
-                        )
-
-                    _log(scrape_run_id,
-                         f"Facebook — chunk {chunk_num} saved",
-                         f"{len(normalized)} new post(s) saved — "
-                         f"{stats['leads_saved']} total, {stats['leads_skipped']} duplicate(s).",
-                         level="success")
-
-                # Update group registry (bookkeeping only — doesn't gate re-scraping)
+                # Update group registry
                 for url in discovered_urls:
                     ScrapedFbGroup.objects.update_or_create(
                         group_url=url,
