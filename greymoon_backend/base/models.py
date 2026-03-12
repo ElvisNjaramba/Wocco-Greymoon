@@ -1,5 +1,6 @@
 from django.db import models
 
+
 class ServiceLead(models.Model):
 
     STATUS_CHOICES = [
@@ -28,7 +29,7 @@ class ServiceLead(models.Model):
     # ── Classification ────────────────────────────────────────────
     source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default="CRAIGSLIST")
     category = models.CharField(max_length=255, null=True, blank=True)
-    service_category = models.CharField(max_length=100, null=True, blank=True)  # cleaning / maintenance / waste_management
+    service_category = models.CharField(max_length=100, null=True, blank=True)
     label = models.CharField(max_length=100, null=True, blank=True)
 
     # ── Location ──────────────────────────────────────────────────
@@ -42,6 +43,12 @@ class ServiceLead(models.Model):
     phone = models.CharField(max_length=50, null=True, blank=True)
     email = models.CharField(max_length=255, null=True, blank=True)
     zip_code = models.CharField(max_length=20, null=True, blank=True)
+
+    # ── Facebook group attribution ────────────────────────────────
+    # Stores which group the post was scraped from so leads can be
+    # filtered/grouped by source group in the UI.
+    fb_group_name = models.CharField(max_length=500, null=True, blank=True)
+    fb_group_url = models.URLField(max_length=1000, null=True, blank=True)
 
     # ── CRM ───────────────────────────────────────────────────────
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="NEW")
@@ -67,6 +74,7 @@ class ServiceLead(models.Model):
             models.Index(fields=["source"]),
             models.Index(fields=["service_category"]),
             models.Index(fields=["score"]),
+            models.Index(fields=["fb_group_name"]),
         ]
 
 
@@ -79,23 +87,36 @@ class ScrapeRun(models.Model):
         ("FAILED", "Failed"),
         ("ABORTED", "Aborted"),
     ]
+
+    # ── Live progress ─────────────────────────────────────────────
     current_stage = models.CharField(max_length=200, null=True, blank=True)
-    stage_detail   = models.TextField(null=True, blank=True)
-    activity_log   = models.JSONField(default=list, blank=True)
+    stage_detail = models.TextField(null=True, blank=True)
+    activity_log = models.JSONField(default=list, blank=True)
+
     # ── Identity ──────────────────────────────────────────────────
     run_id = models.CharField(max_length=100)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="RUNNING")
 
-    # ── Search context (what the user asked for) ──────────────────
-    location_type = models.CharField(max_length=20, null=True, blank=True)    # state/city/zip
-    location_value = models.CharField(max_length=100, null=True, blank=True)  # TX / Houston / 77001
+    # ── Search context ────────────────────────────────────────────
+    location_type = models.CharField(max_length=20, null=True, blank=True)
+    location_value = models.CharField(max_length=100, null=True, blank=True)
     location_display = models.CharField(max_length=255, null=True, blank=True)
-    categories = models.JSONField(null=True, blank=True)   # ["cleaning", "maintenance"]
-    sources = models.JSONField(null=True, blank=True)      # ["craigslist", "facebook"]
+    categories = models.JSONField(null=True, blank=True)
+    sources = models.JSONField(null=True, blank=True)
 
     # ── Results ───────────────────────────────────────────────────
     leads_collected = models.IntegerField(default=0)
     leads_skipped = models.IntegerField(default=0)
+
+    # ── Cancellation ──────────────────────────────────────────────
+    # apify_run_ids: list of active Apify actor run IDs for this scrape run.
+    # The pipeline registers each Apify run here immediately after launch,
+    # so cancel_scrape can call /abort on the right IDs.
+    apify_run_ids = models.JSONField(default=list, blank=True)
+
+    # cancel_requested: set to True by cancel_scrape view.
+    # The pipeline thread checks this between batches and stops if True.
+    cancel_requested = models.BooleanField(default=False)
 
     # ── Timestamps ───────────────────────────────────────────────
     created_at = models.DateTimeField(auto_now_add=True)

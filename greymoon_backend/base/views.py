@@ -72,6 +72,11 @@ def manual_scrape(request):
     max_groups = int(data.get("max_groups", 20))
     max_groups = max(1, min(max_groups, 100))  # clamp 1–100
 
+    # Optional custom FB search keywords (user-entered free text)
+    fb_custom_keywords = data.get("fb_custom_keywords") or []
+    if isinstance(fb_custom_keywords, str):
+        fb_custom_keywords = [k.strip() for k in fb_custom_keywords.split(",") if k.strip()]
+
     try:
         location_data = resolve_location(location_type, location_value)
     except LocationResolutionError as e:
@@ -97,6 +102,7 @@ def manual_scrape(request):
         sources=sources,
         scrape_run_id=run.pk,
         max_groups=max_groups,
+        fb_custom_keywords=fb_custom_keywords,
     )
 
     return Response({
@@ -118,40 +124,58 @@ def cancel_scrape(request):
     if not run_id:
         return Response({"error": "run_id required"}, status=400)
 
-    headers = {"Authorization": f"Bearer {settings.APIFY_TOKEN}"}
-    try:
-        requests.post(
-            f"https://api.apify.com/v2/actor-runs/{run_id}/abort",
-            headers=headers,
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"[Cancel] Apify abort call failed (non-fatal): {e}")
-
     run = ScrapeRun.objects.filter(run_id=run_id).first()
-    if run:
-        run.status = "PARTIAL" if run.leads_collected > 0 else "ABORTED"
-        run.finished_at = datetime.now(timezone.utc)
-        run.current_stage = "Stopped by user"
-        run.stage_detail = (
-            f"Run cancelled — {run.leads_collected} lead(s) already saved to database."
-            if run.leads_collected > 0
-            else "Run cancelled before any leads were collected."
-        )
-        # Append cancel entry to the log
-        log = run.activity_log or []
-        log.append({
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "stage": "Stopped by user",
-            "detail": run.stage_detail,
-            "level": "warning",
-        })
-        run.activity_log = log
-        run.save()
+    if not run:
+        return Response({"error": "Run not found"}, status=404)
+
+    # Step 1: Set cancel_requested flag so the pipeline thread stops
+    # launching new Apify actors between batches.
+    ScrapeRun.objects.filter(run_id=run_id).update(cancel_requested=True)
+
+    # Step 2: Abort every active Apify run ID stored on this ScrapeRun.
+    # These are the REAL Apify actor run IDs, not our internal UUID.
+    apify_headers = {"Authorization": f"Bearer {settings.APIFY_TOKEN}"}
+    apify_run_ids = run.apify_run_ids or []
+    aborted = []
+    for apify_id in apify_run_ids:
+        try:
+            resp = requests.post(
+                f"https://api.apify.com/v2/actor-runs/{apify_id}/abort",
+                headers=apify_headers,
+                timeout=10,
+            )
+            if resp.status_code in (200, 204):
+                aborted.append(apify_id)
+                print(f"[Cancel] Aborted Apify run {apify_id}")
+            else:
+                print(f"[Cancel] Apify abort returned {resp.status_code} for {apify_id}")
+        except Exception as e:
+            print(f"[Cancel] Apify abort call failed for {apify_id}: {e}")
+
+    # Step 3: Mark the ScrapeRun as stopped
+    detail = (
+        f"Run cancelled — {run.leads_collected} lead(s) already saved to database."
+        if run.leads_collected > 0
+        else "Run cancelled before any leads were collected."
+    )
+    log = run.activity_log or []
+    log.append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "stage": "Stopped by user",
+        "detail": detail,
+        "level": "warning",
+    })
+    run.status = "PARTIAL" if run.leads_collected > 0 else "ABORTED"
+    run.finished_at = datetime.now(timezone.utc)
+    run.current_stage = "Stopped by user"
+    run.stage_detail = detail
+    run.activity_log = log
+    run.save()
 
     return Response({
         "message": f"Scrape {run_id} cancelled.",
-        "leads_saved_so_far": run.leads_collected if run else 0,
+        "apify_runs_aborted": len(aborted),
+        "leads_saved_so_far": run.leads_collected,
     })
 
 
@@ -237,7 +261,50 @@ def list_services(request):
         leads = leads.filter(location__icontains=search) | \
                 leads.filter(title__icontains=search)
 
-    leads = leads.order_by("-score", "-created_at")
+    # has_phone / has_email — filter server-side so pagination is correct
+    if request.query_params.get("has_phone") in ("true", "1"):
+        leads = leads.exclude(phone__isnull=True).exclude(phone="")
+    if request.query_params.get("has_email") in ("true", "1"):
+        leads = leads.exclude(email__isnull=True).exclude(email="")
+
+    # fb_group — filter by group name (partial match)
+    fb_group = request.query_params.get("fb_group")
+    if fb_group:
+        leads = leads.filter(fb_group_name__icontains=fb_group)
+
+    # ── Date filter (recency) ─────────────────────────────────
+    date_after = request.query_params.get("date_after")
+    if date_after:
+        try:
+            from django.utils.dateparse import parse_datetime
+            dt = parse_datetime(date_after)
+            if dt:
+                leads = leads.filter(created_at__gte=dt)
+        except Exception:
+            pass
+
+    # ── Ordering ──────────────────────────────────────────────
+    # Frontend sends e.g. ordering=-datetime or ordering=score
+    # Default: newest scraped first (-created_at)
+    ordering_param = request.query_params.get("ordering", "-created_at")
+    ALLOWED_ORDERING_FIELDS = {
+        "datetime", "-datetime",
+        "score", "-score",
+        "created_at", "-created_at",
+    }
+    if ordering_param not in ALLOWED_ORDERING_FIELDS:
+        ordering_param = "-created_at"
+
+    # Map frontend "datetime" field to the actual model field "created_at"
+    # so newly scraped items always surface first by default.
+    # If the user explicitly sorts by "datetime" (post date), honour that too.
+    if ordering_param == "-datetime":
+        leads = leads.order_by("-created_at")
+    elif ordering_param == "datetime":
+        leads = leads.order_by("created_at")
+    else:
+        # For score sorts, use created_at as a tiebreaker so newest still wins
+        leads = leads.order_by(ordering_param, "-created_at")
 
     total = leads.count()
 
