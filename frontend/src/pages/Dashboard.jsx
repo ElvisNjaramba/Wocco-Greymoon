@@ -267,12 +267,17 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
   const log          = scrapeStatus?.activity_log || [];
   const currentStage = scrapeStatus?.current_stage || "Initialising...";
   const stageDetail  = scrapeStatus?.stage_detail  || "";
-  const saved        = scrapeStatus?.leads_collected || 0;
+  const serverSaved  = scrapeStatus?.leads_collected || 0;
   const skipped      = scrapeStatus?.leads_skipped   || 0;
   const sources      = scrapeStatus?.sources || [];
   const activeSrc    = stageSource(currentStage);
   const activeFamily = sourceFamily(activeSrc);
   const activeCfg    = SOURCE_CFG[activeFamily?.toUpperCase()];
+
+  // Always show the highest count we know about — local state (from polling
+  // new rows) vs server-side counter (from checkScrapeStatus). They update
+  // on slightly different cycles so taking the max avoids flicker/regression.
+  const displayCount = Math.max(liveLeadCount ?? 0, serverSaved);
   useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [log.length]);
   const [elapsed, setElapsed] = useState(0);
   const startTs = scrapeStatus?.started_at ? new Date(scrapeStatus.started_at) : new Date();
@@ -329,8 +334,8 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
           <div className="grid grid-cols-3 gap-2">
             <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl px-3 py-2.5">
               <div className="text-[9px] text-white/25 uppercase tracking-widest mb-1">Leads saved</div>
-              <div className="text-xl font-bold tabular-nums text-emerald-400">{liveLeadCount ?? saved}</div>
-              {(liveLeadCount ?? saved) > 0 && <div className="text-[9px] text-emerald-400/40 mt-0.5 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />live</div>}
+              <div className="text-xl font-bold tabular-nums text-emerald-400">{displayCount}</div>
+              {displayCount > 0 && <div className="text-[9px] text-emerald-400/40 mt-0.5 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />live</div>}
             </div>
             <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl px-3 py-2.5">
               <div className="text-[9px] text-white/25 uppercase tracking-widest mb-1">Duplicates</div>
@@ -1070,7 +1075,15 @@ export default function Services() {
 
   useEffect(() => {
     if (!scraping) return;
-    const iv = setInterval(() => { checkScrapeStatus(); fetchHistory(); fetchNewLeadsOnly(); }, 3000);
+    // Tight loop: check status (carries server-side leads_collected) every 2s,
+    // fetch new leads every 3s, history every 10s
+    let tick = 0;
+    const iv = setInterval(() => {
+      tick++;
+      checkScrapeStatus();           // always — carries leads_collected from DB
+      fetchNewLeadsOnly();           // always — streams new lead rows into state
+      if (tick % 4 === 0) fetchHistory();
+    }, 2000);
     return () => clearInterval(iv);
   }, [scraping, checkScrapeStatus, fetchHistory, fetchNewLeadsOnly]);
 
@@ -1493,7 +1506,7 @@ export default function Services() {
                     <Loader className="w-3 h-3 animate-spin" />
                     <span className="hidden sm:inline">{isAborting ? "Stopping..." : navCfg ? `${navCfg.emoji} ${navCfg.name}` : "Running..."}</span>
                   </div>
-                  {totalLeads > 0 && <span className="hidden sm:flex items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-bold px-2.5 py-1 rounded-full"><span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />{totalLeads}</span>}
+                  {Math.max(totalLeads, scrapeStatus?.leads_collected ?? 0) > 0 && <span className="hidden sm:flex items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-bold px-2.5 py-1 rounded-full"><span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />{Math.max(totalLeads, scrapeStatus?.leads_collected ?? 0)}</span>}
                 </div>
               );
             })()}
@@ -1515,7 +1528,7 @@ export default function Services() {
               <div className="px-4 py-3 border-b border-white/[0.06] flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
                 <span className="text-xs font-semibold text-white/60">Leads — updating live</span>
-                <span className="text-[11px] text-white/25 ml-auto">{totalLeads} total</span>
+                <span className="text-[11px] text-white/25 ml-auto">{Math.max(totalLeads, scrapeStatus?.leads_collected ?? 0)} total</span>
               </div>
               <div className="divide-y divide-white/[0.04] max-h-[400px] overflow-y-auto">
                 {leads.slice(0, 20).map(lead => (
