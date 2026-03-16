@@ -1,18 +1,4 @@
-# ============================================================
-#  normalizer.py
-#  The great unifier. Raw Craigslist JSON and raw Facebook JSON
-#  look nothing alike — this file bridges both into the same
-#  clean ServiceLead-compatible dict.
-#
-#  Both sources produce:
-#    post_id, url, title, post, phone, email, location,
-#    category, state, latitude, longitude, source, raw_json
-#
-#  ZIP code support:
-#    normalize_facebook() now accepts an optional zip_code kwarg.
-#    When a ZIP-based scrape is triggered the ZIP is stored on
-#    every Facebook lead so it can be filtered/displayed in the UI.
-# ============================================================
+
 
 import hashlib
 import re

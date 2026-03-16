@@ -1,21 +1,3 @@
-# ============================================================
-#  location_resolver.py
-#
-#  Resolves user location input (state / city / zip) into:
-#    - Craigslist city codes
-#    - Human-readable location string for Facebook keyword search
-#
-#  Robust version: handles common mismatches like
-#    - Full state name passed as state code ("Florida" → FL)
-#    - City name accidentally sent as state type
-#    - State code sent as city type
-#
-#  ZIP support: expanded ZIP_PREFIX_MAP covers all 50 states
-#  with ~900 prefix entries mapping to the correct CL region.
-#  When a ZIP is provided the facebook_location_str includes
-#  the raw ZIP so FB group search finds hyper-local results.
-# ============================================================
-
 from .city_structure import US_CITY_STRUCTURE
 
 # ── Flat lookups built once at import time ────────────────────

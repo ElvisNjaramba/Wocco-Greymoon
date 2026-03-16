@@ -54,9 +54,9 @@ def manual_scrape(request):
     if location_type not in ("state", "city", "zip"):
         return Response({"error": "location.type must be 'state', 'city', or 'zip'."}, status=400)
 
-    fb_group_urls_raw    = data.get("fb_group_urls") or []
+    fb_group_urls_raw      = data.get("fb_group_urls") or []
     fb_custom_keywords_raw = data.get("fb_custom_keywords") or []
-    sources              = data.get("sources", ["craigslist"])
+    sources                = data.get("sources", ["craigslist"])
 
     # Normalise keyword input (string or list)
     if isinstance(fb_custom_keywords_raw, str):
@@ -65,9 +65,6 @@ def manual_scrape(request):
     fb_only = set(sources) == {"facebook"}
 
     # ── FB custom-keyword smart parsing ──────────────────────
-    # When the user runs a Facebook-only search using free-text
-    # custom keywords (no explicit category or location), we
-    # extract both from the phrase text automatically.
     parsed_location_type  = location_type
     parsed_location_value = location_value
     categories            = data.get("categories", [])
@@ -75,17 +72,11 @@ def manual_scrape(request):
 
     if fb_only and fb_custom_keywords_raw:
         parsed = parse_custom_search(fb_custom_keywords_raw)
-
-        # Category: use parsed result if none supplied by user
         if not categories:
             categories = parsed["categories"]
-
-        # Location: use parsed result if none supplied by user
         if not location_value and parsed["location_type"]:
             parsed_location_type  = parsed["location_type"]
             parsed_location_value = parsed["location_value"] or ""
-
-        # Use location-stripped keywords for the actual FB query
         clean_fb_keywords = parsed["clean_keywords"]
 
     # ── Basic validations ─────────────────────────────────────
@@ -108,8 +99,8 @@ def manual_scrape(request):
             status=400,
         )
 
-    valid_sources    = {"craigslist", "facebook"}
-    invalid_sources  = [s for s in sources if s not in valid_sources]
+    valid_sources   = {"craigslist", "facebook", "indeed", "google"}
+    invalid_sources = [s for s in sources if s not in valid_sources]
     if invalid_sources:
         return Response(
             {"error": f"Invalid sources: {invalid_sources}. Valid: {list(valid_sources)}"},
@@ -120,9 +111,14 @@ def manual_scrape(request):
     max_groups = int(data.get("max_groups", 20))
     max_groups = max(1, min(max_groups, 100))
 
-    # Posts per group limit (user-configurable, default 50)
+    # Posts per group limit
     max_posts_per_group = int(data.get("max_posts_per_group", 50))
     max_posts_per_group = max(5, min(max_posts_per_group, 500))
+
+    # ── Google settings ───────────────────────────────────────
+    google_max_pages   = int(data.get("google_max_pages", 3))
+    google_max_pages   = max(1, min(google_max_pages, 10))
+    google_deep_scrape = bool(data.get("google_deep_scrape", True))
 
     # Normalise manual group URLs
     fb_group_urls = fb_group_urls_raw
@@ -130,7 +126,7 @@ def manual_scrape(request):
         fb_group_urls = [u.strip() for u in fb_group_urls.split(",") if u.strip()]
     fb_group_urls = [u for u in fb_group_urls if u.startswith("http")]
 
-    # Resolve location (uses parsed values when extracted from keywords)
+    # Resolve location
     if parsed_location_value:
         try:
             location_data = resolve_location(parsed_location_type, parsed_location_value)
@@ -153,6 +149,9 @@ def manual_scrape(request):
         current_stage="Starting",
         stage_detail="Pipeline initialising…",
         activity_log=[],
+        # Google settings stored on the run for history display
+        google_max_pages=google_max_pages,
+        google_deep_scrape=google_deep_scrape,
     )
 
     start_pipeline_thread(
@@ -165,11 +164,12 @@ def manual_scrape(request):
         max_posts_per_group=max_posts_per_group,
         fb_custom_keywords=clean_fb_keywords,
         fb_group_urls=fb_group_urls,
+        google_max_pages=google_max_pages,
+        google_deep_scrape=google_deep_scrape,
     )
 
     response_location = location_data["display"] if location_data else location_display
 
-    # Include parsing notes in the response so the frontend can show what was inferred
     parsing_notes = {}
     if fb_only and fb_custom_keywords_raw:
         if not data.get("categories"):
@@ -197,13 +197,6 @@ def manual_scrape(request):
 # ── Scrape: Cancel helpers ────────────────────────────────────
 
 def _sweep_and_abort(apify_headers: dict, already_aborted: set) -> list[str]:
-    """
-    Query Apify for all RUNNING and READY actors, abort any not yet
-    in already_aborted.  Returns list of newly aborted IDs.
-
-    We check both RUNNING and READY because a just-launched actor spends
-    a few seconds in READY before it appears as RUNNING.
-    """
     newly = []
     for status_filter in ("RUNNING", "READY"):
         try:
@@ -248,18 +241,11 @@ def cancel_scrape(request):
     if not run:
         return Response({"error": "Run not found"}, status=404)
 
-    # ── Step 1: Set cancel flag ───────────────────────────────
-    # The pipeline thread checks this BEFORE every actor launch and on
-    # every poll tick. Setting it first guarantees the pipeline won't
-    # launch any new actors after this point.
     ScrapeRun.objects.filter(run_id=run_id).update(cancel_requested=True)
 
-    apify_headers = {"Authorization": f"Bearer {settings.APIFY_TOKEN}"}
+    apify_headers  = {"Authorization": f"Bearer {settings.APIFY_TOKEN}"}
     aborted_set: set = set()
 
-    # ── Step 2: Abort every registered actor ID ───────────────
-    # The pipeline registers each actor ID immediately after launch so
-    # this list is almost always complete.
     for apify_id in (run.apify_run_ids or []):
         try:
             resp = requests.post(
@@ -273,21 +259,13 @@ def cancel_scrape(request):
         except Exception as e:
             print(f"[Cancel] Abort failed for registered actor {apify_id}: {e}")
 
-    # ── Step 3: First account-wide sweep ─────────────────────
-    # Catches any actor that was in-flight (between launch and registration)
-    # at the moment Step 2 ran.
     _sweep_and_abort(apify_headers, aborted_set)
 
-    # ── Step 4: Wait 3 s + second sweep ──────────────────────
-    # Apify takes 1-3 s to transition a just-launched actor from
-    # STARTING → READY → RUNNING. A second sweep after a short delay
-    # catches anything that wasn't visible yet during Step 3.
     import time as _time
     _time.sleep(3)
     _sweep_and_abort(apify_headers, aborted_set)
 
-    # ── Step 5: Mark the run as stopped ──────────────────────
-    run.refresh_from_db()   # pick up latest leads_collected count
+    run.refresh_from_db()
     detail = (
         f"Run cancelled — {run.leads_collected} lead(s) already saved to database."
         if run.leads_collected > 0
@@ -347,48 +325,36 @@ def scrape_history(request):
     runs = ScrapeRun.objects.order_by("-created_at")[:50]
     return Response([
         {
-            "run_id":          r.run_id,
-            "status":          r.status,
-            "location":        r.location_display,
-            "categories":      r.categories,
-            "sources":         r.sources,
-            "leads_collected": r.leads_collected,
-            "leads_skipped":   r.leads_skipped,
-            "started_at":      r.created_at,
-            "finished_at":     r.finished_at,
+            "run_id":             r.run_id,
+            "status":             r.status,
+            "location":           r.location_display,
+            "categories":         r.categories,
+            "sources":            r.sources,
+            "leads_collected":    r.leads_collected,
+            "leads_skipped":      r.leads_skipped,
+            "started_at":         r.created_at,
+            "finished_at":        r.finished_at,
         }
         for r in runs
     ])
 
 
-# ── Scraped FB Groups: List ──────────────────────────────────
+# ── Scraped FB Groups: List ───────────────────────────────────
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def list_scraped_groups(request):
-    """
-    Return all scraped FB groups with human-readable names.
-
-    Name resolution priority:
-      1. group_name stored by the search actor (real FB group name)
-      2. CamelCase/hyphenated slug derived from the URL path
-      3. Raw URL as final fallback
-    """
     from base.models import ScrapedFbGroup
 
     def _display_name(group_name: str, group_url: str) -> str:
         if group_name and group_name.strip():
             return group_name.strip()
-        # Derive from URL slug: /groups/HoustonCleaningPros/ → Houston Cleaning Pros
         m = re.search(r"/groups/([^/?#]+)", group_url or "")
         if m:
             slug = m.group(1)
-            # CamelCase → spaced
             slug = re.sub(r"([a-z])([A-Z])", r"\1 \2", slug)
             slug = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", slug)
-            # hyphens / underscores → space
             slug = re.sub(r"[-_]", " ", slug)
-            # collapse multiple spaces
             slug = re.sub(r"\s+", " ", slug).strip()
             return slug.title() if slug else group_url
         return group_url or "Unknown group"
@@ -402,16 +368,15 @@ def list_scraped_groups(request):
     return Response({"groups": groups, "total": len(groups)})
 
 
-# ── Scraped FB Groups: Leads for a group ──────────────────────
+# ── Scraped FB Groups: Leads for a group ─────────────────────
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def list_group_leads(request):
-    """Return leads belonging to a specific group URL."""
     group_url = request.query_params.get("group_url", "")
     if not group_url:
         return Response({"error": "group_url required"}, status=400)
-    leads = ServiceLead.objects.filter(fb_group_url=group_url).order_by("-created_at")
+    leads       = ServiceLead.objects.filter(fb_group_url=group_url).order_by("-created_at")
     page_size   = min(200, int(request.query_params.get("page_size", 50)))
     page        = max(1, int(request.query_params.get("page", 1)))
     total       = leads.count()
@@ -428,12 +393,11 @@ def list_group_leads(request):
     })
 
 
-# ── Scraped FB Groups: Delete a group ─────────────────────────
+# ── Scraped FB Groups: Delete a group ────────────────────────
 
 @api_view(["DELETE"])
 @permission_classes([IsAuthenticated])
 def delete_scraped_group(request):
-    """Remove a group from the scraped-groups registry so it can be re-scraped."""
     from base.models import ScrapedFbGroup
     group_url = request.data.get("group_url", "")
     if not group_url:
@@ -594,15 +558,6 @@ def get_categories(request):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def parse_keywords_preview(request):
-    """
-    Preview endpoint — lets the frontend show what category and
-    location were inferred from custom search keywords before
-    the user commits to starting a scrape.
-
-    POST body: { "keywords": ["house cleaning in Houston TX"] }
-    Response:  { "categories": ["cleaning"], "location_type": "city",
-                 "location_value": "Houston", "clean_keywords": [...] }
-    """
     raw = request.data.get("keywords", [])
     if isinstance(raw, str):
         raw = [k.strip() for k in raw.split(",") if k.strip()]

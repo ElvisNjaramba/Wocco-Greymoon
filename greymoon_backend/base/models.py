@@ -111,6 +111,9 @@ class ScrapeRun(models.Model):
     # ── FB scrape settings ───────────────────────────────────────
     max_posts_per_group = models.IntegerField(default=50)
 
+    google_max_pages   = models.IntegerField(default=3)
+    google_deep_scrape = models.BooleanField(default=True)
+
     # ── Cancellation ──────────────────────────────────────────────
     # apify_run_ids: list of active Apify actor run IDs for this scrape run.
     # The pipeline registers each Apify run here immediately after launch,
