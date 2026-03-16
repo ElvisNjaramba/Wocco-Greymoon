@@ -1,5 +1,5 @@
 # ============================================================
-#  views.py
+#  views.py  —  manual-groups-only Facebook integration
 # ============================================================
 
 import re
@@ -17,7 +17,6 @@ from .services.tasks import start_pipeline_thread
 from .services.category_map import ALL_CATEGORIES, SERVICE_CATEGORY_MAP
 from .services.location_resolver import resolve_location, LocationResolutionError
 from .services.city_structure import US_CITY_STRUCTURE
-from .services.keyword_parser import parse_custom_search
 
 PAGE_SIZE = 50
 
@@ -44,61 +43,8 @@ _STATE_NAME_TO_ABBREV = {
 @permission_classes([IsAuthenticated])
 def manual_scrape(request):
     data = request.data
-    location = data.get("location")
-    if not location or not isinstance(location, dict):
-        return Response({"error": "location is required. Provide {type, value}."}, status=400)
 
-    location_type  = location.get("type", "").lower()
-    location_value = location.get("value", "").strip()
-
-    if location_type not in ("state", "city", "zip"):
-        return Response({"error": "location.type must be 'state', 'city', or 'zip'."}, status=400)
-
-    fb_group_urls_raw      = data.get("fb_group_urls") or []
-    fb_custom_keywords_raw = data.get("fb_custom_keywords") or []
-    sources                = data.get("sources", ["craigslist"])
-
-    # Normalise keyword input (string or list)
-    if isinstance(fb_custom_keywords_raw, str):
-        fb_custom_keywords_raw = [k.strip() for k in fb_custom_keywords_raw.split(",") if k.strip()]
-
-    fb_only = set(sources) == {"facebook"}
-
-    # ── FB custom-keyword smart parsing ──────────────────────
-    parsed_location_type  = location_type
-    parsed_location_value = location_value
-    categories            = data.get("categories", [])
-    clean_fb_keywords     = list(fb_custom_keywords_raw)
-
-    if fb_only and fb_custom_keywords_raw:
-        parsed = parse_custom_search(fb_custom_keywords_raw)
-        if not categories:
-            categories = parsed["categories"]
-        if not location_value and parsed["location_type"]:
-            parsed_location_type  = parsed["location_type"]
-            parsed_location_value = parsed["location_value"] or ""
-        clean_fb_keywords = parsed["clean_keywords"]
-
-    # ── Basic validations ─────────────────────────────────────
-    fb_group_urls_preview = fb_group_urls_raw
-    if not parsed_location_value and not fb_group_urls_preview and not fb_custom_keywords_raw:
-        return Response({"error": "location.value cannot be empty."}, status=400)
-    if not parsed_location_value and "craigslist" in sources:
-        return Response({"error": "location.value is required when scraping Craigslist."}, status=400)
-
-    if not categories:
-        return Response(
-            {"error": f"At least one category required. Options: {ALL_CATEGORIES}"},
-            status=400,
-        )
-
-    invalid_cats = [c for c in categories if c not in ALL_CATEGORIES]
-    if invalid_cats:
-        return Response(
-            {"error": f"Invalid categories: {invalid_cats}. Valid: {ALL_CATEGORIES}"},
-            status=400,
-        )
-
+    sources = data.get("sources", ["craigslist"])
     valid_sources   = {"craigslist", "facebook", "indeed", "google"}
     invalid_sources = [s for s in sources if s not in valid_sources]
     if invalid_sources:
@@ -107,41 +53,70 @@ def manual_scrape(request):
             status=400,
         )
 
-    # Facebook group discovery limit
-    max_groups = int(data.get("max_groups", 20))
-    max_groups = max(1, min(max_groups, 100))
+    # ── Location (optional for FB-only runs) ──────────────────
+    location = data.get("location") or {}
+    location_type  = location.get("type", "").lower() if location else ""
+    location_value = (location.get("value") or "").strip() if location else ""
+
+    if location_type and location_type not in ("state", "city", "zip"):
+        return Response({"error": "location.type must be 'state', 'city', or 'zip'."}, status=400)
+
+    # ── Facebook group URLs ───────────────────────────────────
+    fb_group_urls_raw = data.get("fb_group_urls") or []
+    if isinstance(fb_group_urls_raw, str):
+        fb_group_urls_raw = [u.strip() for u in fb_group_urls_raw.split(",") if u.strip()]
+    fb_group_urls = [u for u in fb_group_urls_raw if u.startswith("http")]
+
+    fb_only = set(sources) == {"facebook"}
+
+    # Validation
+    if not location_value and not fb_group_urls:
+        return Response({"error": "Provide a location or at least one Facebook group URL."}, status=400)
+    if not location_value and "craigslist" in sources:
+        return Response({"error": "location.value is required when scraping Craigslist."}, status=400)
+
+    categories = data.get("categories", [])
+    # Categories are only required when scraping non-Facebook sources
+    non_fb_sources = [s for s in sources if s != "facebook"]
+    if non_fb_sources and not categories:
+        return Response(
+            {"error": f"At least one category required for {non_fb_sources}. Options: {ALL_CATEGORIES}"},
+            status=400,
+        )
+
+    if categories:
+        invalid_cats = [c for c in categories if c not in ALL_CATEGORIES]
+        if invalid_cats:
+            return Response(
+                {"error": f"Invalid categories: {invalid_cats}. Valid: {ALL_CATEGORIES}"},
+                status=400,
+            )
 
     # Posts per group limit
     max_posts_per_group = int(data.get("max_posts_per_group", 50))
     max_posts_per_group = max(5, min(max_posts_per_group, 500))
 
-    # ── Google settings ───────────────────────────────────────
+    # Google settings
     google_max_pages   = int(data.get("google_max_pages", 3))
     google_max_pages   = max(1, min(google_max_pages, 10))
     google_deep_scrape = bool(data.get("google_deep_scrape", True))
 
-    # Normalise manual group URLs
-    fb_group_urls = fb_group_urls_raw
-    if isinstance(fb_group_urls, str):
-        fb_group_urls = [u.strip() for u in fb_group_urls.split(",") if u.strip()]
-    fb_group_urls = [u for u in fb_group_urls if u.startswith("http")]
-
     # Resolve location
-    if parsed_location_value:
+    if location_value:
         try:
-            location_data = resolve_location(parsed_location_type, parsed_location_value)
+            location_data = resolve_location(location_type, location_value)
         except LocationResolutionError as e:
             return Response({"error": str(e)}, status=400)
         location_display = location_data["display"]
     else:
         location_data    = None
-        location_display = "Custom FB search"
+        location_display = "Facebook Groups"
 
     run = ScrapeRun.objects.create(
         run_id=str(uuid.uuid4()),
         status="RUNNING",
-        location_type=parsed_location_type,
-        location_value=parsed_location_value,
+        location_type=location_type or "custom",
+        location_value=location_value or "",
         location_display=location_display,
         max_posts_per_group=max_posts_per_group,
         categories=categories,
@@ -149,48 +124,30 @@ def manual_scrape(request):
         current_stage="Starting",
         stage_detail="Pipeline initialising…",
         activity_log=[],
-        # Google settings stored on the run for history display
         google_max_pages=google_max_pages,
         google_deep_scrape=google_deep_scrape,
     )
 
     start_pipeline_thread(
-        location_type=parsed_location_type,
-        location_value=parsed_location_value,
+        location_type=location_type or "custom",
+        location_value=location_value or "",
         categories=categories,
         sources=sources,
         scrape_run_id=run.pk,
-        max_groups=max_groups,
         max_posts_per_group=max_posts_per_group,
-        fb_custom_keywords=clean_fb_keywords,
         fb_group_urls=fb_group_urls,
         google_max_pages=google_max_pages,
         google_deep_scrape=google_deep_scrape,
     )
 
-    response_location = location_data["display"] if location_data else location_display
-
-    parsing_notes = {}
-    if fb_only and fb_custom_keywords_raw:
-        if not data.get("categories"):
-            parsing_notes["categories_inferred"] = categories
-        if not location_value and parsed_location_value:
-            parsing_notes["location_inferred"] = {
-                "type": parsed_location_type,
-                "value": parsed_location_value,
-                "display": location_display,
-            }
-        if clean_fb_keywords != fb_custom_keywords_raw:
-            parsing_notes["keywords_cleaned"] = clean_fb_keywords
-
     return Response({
         "message": "Scrape started successfully.",
-        "run_id": run.run_id,
-        "location": response_location,
+        "run_id":  run.run_id,
+        "location": location_display,
         "categories": categories,
         "sources": sources,
-        "estimated_time": "2–10 minutes depending on sources and location size",
-        **({"parsing_notes": parsing_notes} if parsing_notes else {}),
+        "fb_groups": len(fb_group_urls),
+        "estimated_time": "2–10 minutes depending on sources and group size",
     }, status=202)
 
 
@@ -220,7 +177,6 @@ def _sweep_and_abort(apify_headers: dict, already_aborted: set) -> list[str]:
                         if ar.status_code in (200, 204):
                             newly.append(aid)
                             already_aborted.add(aid)
-                            print(f"[Cancel] Aborted actor {aid} (was {status_filter})")
                     except Exception as e:
                         print(f"[Cancel] Could not abort actor {aid}: {e}")
         except Exception as e:
@@ -255,7 +211,6 @@ def cancel_scrape(request):
             )
             if resp.status_code in (200, 204):
                 aborted_set.add(apify_id)
-                print(f"[Cancel] Aborted registered actor {apify_id}")
         except Exception as e:
             print(f"[Cancel] Abort failed for registered actor {apify_id}: {e}")
 
@@ -325,27 +280,62 @@ def scrape_history(request):
     runs = ScrapeRun.objects.order_by("-created_at")[:50]
     return Response([
         {
-            "run_id":             r.run_id,
-            "status":             r.status,
-            "location":           r.location_display,
-            "categories":         r.categories,
-            "sources":            r.sources,
-            "leads_collected":    r.leads_collected,
-            "leads_skipped":      r.leads_skipped,
-            "started_at":         r.created_at,
-            "finished_at":        r.finished_at,
+            "run_id":          r.run_id,
+            "status":          r.status,
+            "location":        r.location_display,
+            "categories":      r.categories,
+            "sources":         r.sources,
+            "leads_collected": r.leads_collected,
+            "leads_skipped":   r.leads_skipped,
+            "started_at":      r.created_at,
+            "finished_at":     r.finished_at,
         }
         for r in runs
     ])
 
 
-# ── Scraped FB Groups: List ───────────────────────────────────
+# ── FB Groups: Add groups (no scraping yet) ───────────────────
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def add_fb_groups(request):
+    """
+    Register one or more Facebook group URLs without scraping them.
+    The user can then trigger scraping from the Groups tab.
+    """
+    urls_raw = request.data.get("group_urls") or []
+    if isinstance(urls_raw, str):
+        urls_raw = [u.strip() for u in re.split(r"[\n,]+", urls_raw) if u.strip()]
+
+    valid_urls = [u for u in urls_raw if u.startswith("http")]
+    if not valid_urls:
+        return Response({"error": "No valid group URLs provided."}, status=400)
+
+    added = []
+    already_exists = []
+    for url in valid_urls:
+        url = url.rstrip("/") + "/"
+        obj, created = ScrapedFbGroup.objects.get_or_create(
+            group_url=url,
+            defaults={"group_name": "", "post_count": 0},
+        )
+        if created:
+            added.append(url)
+        else:
+            already_exists.append(url)
+
+    return Response({
+        "added":          len(added),
+        "already_exists": len(already_exists),
+        "total":          ScrapedFbGroup.objects.count(),
+    })
+
+
+# ── FB Groups: List ───────────────────────────────────────────
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def list_scraped_groups(request):
-    from base.models import ScrapedFbGroup
-
     def _display_name(group_name: str, group_url: str) -> str:
         if group_name and group_name.strip():
             return group_name.strip()
@@ -353,7 +343,6 @@ def list_scraped_groups(request):
         if m:
             slug = m.group(1)
             slug = re.sub(r"([a-z])([A-Z])", r"\1 \2", slug)
-            slug = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", slug)
             slug = re.sub(r"[-_]", " ", slug)
             slug = re.sub(r"\s+", " ", slug).strip()
             return slug.title() if slug else group_url
@@ -368,7 +357,62 @@ def list_scraped_groups(request):
     return Response({"groups": groups, "total": len(groups)})
 
 
-# ── Scraped FB Groups: Leads for a group ─────────────────────
+# ── FB Groups: Scrape selected groups ────────────────────────
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def scrape_selected_groups(request):
+    """
+    Trigger a Facebook-only scrape run for a specific set of group URLs.
+    No category or location required — Facebook scraping is fully independent.
+    max_posts_per_group can be specified per-request.
+    """
+    group_urls = request.data.get("group_urls") or []
+    if isinstance(group_urls, str):
+        group_urls = [u.strip() for u in re.split(r"[\n,]+", group_urls) if u.strip()]
+    group_urls = [u for u in group_urls if u.startswith("http")]
+
+    if not group_urls:
+        return Response({"error": "No valid group URLs provided."}, status=400)
+
+    max_posts_per_group = int(request.data.get("max_posts_per_group", 50))
+    max_posts_per_group = max(5, min(max_posts_per_group, 500))
+
+    run = ScrapeRun.objects.create(
+        run_id=str(uuid.uuid4()),
+        status="RUNNING",
+        location_type="custom",
+        location_value="",
+        location_display=f"{len(group_urls)} Facebook group(s)",
+        max_posts_per_group=max_posts_per_group,
+        categories=[],
+        sources=["facebook"],
+        current_stage="Starting",
+        stage_detail="Pipeline initialising…",
+        activity_log=[],
+        google_max_pages=3,
+        google_deep_scrape=False,
+    )
+
+    start_pipeline_thread(
+        location_type="custom",
+        location_value="",
+        categories=[],
+        sources=["facebook"],
+        scrape_run_id=run.pk,
+        max_posts_per_group=max_posts_per_group,
+        fb_group_urls=group_urls,
+    )
+
+    return Response({
+        "message":   "Facebook scrape started.",
+        "run_id":    run.run_id,
+        "groups":    len(group_urls),
+        "max_posts": max_posts_per_group,
+    }, status=202)
+
+
+# ── FB Groups: Leads for a group ─────────────────────────────
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -393,12 +437,11 @@ def list_group_leads(request):
     })
 
 
-# ── Scraped FB Groups: Delete a group ────────────────────────
+# ── FB Groups: Delete a group ─────────────────────────────────
 
 @api_view(["DELETE"])
 @permission_classes([IsAuthenticated])
 def delete_scraped_group(request):
-    from base.models import ScrapedFbGroup
     group_url = request.data.get("group_url", "")
     if not group_url:
         return Response({"error": "group_url required"}, status=400)
@@ -551,18 +594,3 @@ def get_categories(request):
             for key, val in SERVICE_CATEGORY_MAP.items()
         ]
     })
-
-
-# ── Meta: Parse custom keywords (preview endpoint) ───────────
-
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
-def parse_keywords_preview(request):
-    raw = request.data.get("keywords", [])
-    if isinstance(raw, str):
-        raw = [k.strip() for k in raw.split(",") if k.strip()]
-    if not raw:
-        return Response({"error": "keywords required"}, status=400)
-
-    result = parse_custom_search(raw)
-    return Response(result)

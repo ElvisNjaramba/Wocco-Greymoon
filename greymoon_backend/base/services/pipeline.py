@@ -1,36 +1,32 @@
-# ============================================================
-#  pipeline.py
-# ============================================================
+"""
+pipeline.py  —  manual-groups-only Facebook integration
+────────────────────────────────────────────────────────
+Changes from previous version
+  • Facebook Phase A (group discovery/search) fully removed.
+  • Only manual group URLs are scraped (Phase B).
+  • _process_and_save_fb_batch saves leads immediately after each
+    Apify batch so no data is lost on abort/failure/timeout.
+  • Google enrich_callback correctly wired (unchanged logic, kept).
+"""
 
+import threading
 from datetime import datetime, timezone
-
 from .location_resolver import resolve_location, LocationResolutionError
 from .category_map import get_craigslist_codes, get_facebook_keywords
 from .craigslist_service import scrape_craigslist_progressive
-from .fb_group_search_service import find_facebook_groups
-from .fb_groups_scraper_service import scrape_facebook_groups_progressive
-from .indeed_scraper_service import scrape_indeed_progressive
 from .google_search_service import scrape_google_search_progressive
+from .fb_service import scrape_fb_groups_progressive, upsert_fb_groups
 from .normalizer import normalize_craigslist, normalize_facebook
-from .indeed_normalizer import normalize_indeed
 from .google_normalizer import normalize_google_serp_page
 from .lead_scorer import calculate_lead_score
 
-
 # ── Source → search term maps ─────────────────────────────────
 
-INDEED_CATEGORY_TERMS = {
-    "cleaning":        "cleaning service contractor",
-    "maintenance":     "home maintenance handyman contractor",
-    "waste_management": "junk removal waste management contractor",
-}
-
 GOOGLE_CATEGORY_QUERIES = {
-    "cleaning":        "house cleaning service contractor",
-    "maintenance":     "home maintenance handyman contractor",
+    "cleaning":         "house cleaning service contractor",
+    "maintenance":      "home maintenance handyman contractor",
     "waste_management": "junk removal waste management contractor",
 }
-
 
 # ── Logging helper ────────────────────────────────────────────
 
@@ -56,7 +52,7 @@ def _log(scrape_run_id, stage: str, detail: str, level: str = "info"):
         print(f"[Pipeline] Could not write log entry: {e}")
 
 
-# ── Service logger ────────────────────────────────────────────
+# ── Service logger ─────────────────────────────────────────────
 
 class _ServiceLogger:
     def __init__(self, scrape_run_id, default_stage="Background"):
@@ -72,9 +68,12 @@ class _ServiceLogger:
         low    = detail.lower()
         if any(w in low for w in ("error", "failed", "exception")):
             level = "error"
-        elif any(w in low for w in ("warn", "skipping", "no groups", "partial", "cancel")):
+        elif any(w in low for w in ("warn", "skipping", "no groups",
+                                    "partial", "cancel", "stopping")):
             level = "warning"
-        elif any(w in low for w in ("succeeded", "saved", "complete", "discovered", "got ", "retrieved")):
+        elif any(w in low for w in ("succeeded", "saved", "complete",
+                                    "discovered", "got ", "retrieved",
+                                    "registered", "found")):
             level = "success"
         else:
             level = "info"
@@ -98,21 +97,41 @@ def _cancelled(scrape_run_id) -> bool:
 # ── Batch save helper ─────────────────────────────────────────
 
 def _save_lead_batch(normalized_items, stats, scrape_run_id=None):
+    """
+    Save a list of normalised lead dicts to ServiceLead.
+    Dedup via content_hash and post_id.
+    Saves each lead individually and updates the run counter
+    immediately so live counts are accurate.
+    """
     from base.models import ServiceLead, ScrapeRun
+
+    if not normalized_items:
+        return
+
+    incoming_hashes = {i["content_hash"] for i in normalized_items
+                       if i.get("content_hash")}
+    incoming_ids    = {i["post_id"] for i in normalized_items
+                       if i.get("post_id")}
+
+    existing_hashes = set(
+        ServiceLead.objects.filter(content_hash__in=incoming_hashes)
+        .values_list("content_hash", flat=True)
+    ) if incoming_hashes else set()
+
+    existing_ids = set(
+        ServiceLead.objects.filter(post_id__in=incoming_ids)
+        .values_list("post_id", flat=True)
+    ) if incoming_ids else set()
 
     for lead_data in normalized_items:
         try:
             content_hash = lead_data.get("content_hash")
-            if content_hash and ServiceLead.objects.filter(
-                content_hash=content_hash
-            ).exists():
+            if content_hash and content_hash in existing_hashes:
                 stats["leads_skipped"] += 1
                 continue
 
             post_id = lead_data.get("post_id")
-            if post_id and ServiceLead.objects.filter(
-                post_id=post_id
-            ).exists():
+            if post_id and post_id in existing_ids:
                 stats["leads_skipped"] += 1
                 continue
 
@@ -154,6 +173,12 @@ def _save_lead_batch(normalized_items, stats, scrape_run_id=None):
             )
             stats["leads_saved"] += 1
 
+            if content_hash:
+                existing_hashes.add(content_hash)
+            if post_id:
+                existing_ids.add(post_id)
+
+            # Update run counter after EVERY lead so UI is live
             if scrape_run_id:
                 try:
                     ScrapeRun.objects.filter(pk=scrape_run_id).update(
@@ -164,79 +189,164 @@ def _save_lead_batch(normalized_items, stats, scrape_run_id=None):
                     pass
 
         except Exception as e:
-            print(f"[Pipeline] Failed to save lead: {e}")
-            stats["errors"].append(f"Save error: {str(e)[:100]}")
+            err_msg = f"Save error for post_id={lead_data.get('post_id','?')[:20]}: {str(e)[:150]}"
+            print(f"[Pipeline] {err_msg}")
+            _log(scrape_run_id, "Pipeline — save error", err_msg, level="error")
+            stats["errors"].append(err_msg)
+
+
+# ── Google contact enrichment (background thread) ─────────────
+
+def _enrich_saved_google_leads(contacts_map: dict, scrape_run_id, log):
+    if not contacts_map:
+        return
+    try:
+        from base.models import ServiceLead
+        from django.db.models import Q
+
+        updated = 0
+
+        for norm_key, contacts in contacts_map.items():
+            phones = contacts.get("phones", [])
+            emails = contacts.get("emails", [])
+            if not phones and not emails:
+                continue
+
+            www_key = norm_key.replace("://", "://www.", 1)
+
+            url_filter = (
+                Q(url=norm_key) | Q(url__startswith=norm_key + "/") |
+                Q(url__startswith=norm_key + "?") |
+                Q(url=www_key)  | Q(url__startswith=www_key  + "/") |
+                Q(url__startswith=www_key  + "?")
+            )
+
+            needs_enriching = (
+                Q(phone__isnull=True) | Q(phone="") |
+                Q(email__isnull=True) | Q(email="")
+            )
+
+            leads_to_update = ServiceLead.objects.filter(
+                url_filter, source="GOOGLE",
+            ).filter(needs_enriching)
+
+            for lead in leads_to_update:
+                update_fields = {}
+                if phones and not lead.phone:
+                    update_fields["phone"] = phones[0]
+                if emails and not lead.email:
+                    update_fields["email"] = emails[0]
+                if update_fields:
+                    ServiceLead.objects.filter(pk=lead.pk).update(**update_fields)
+                    updated += 1
+
+        if updated:
+            log(
+                f"[Google Website Crawl] Enriched {updated} saved lead(s) "
+                f"with contact data from crawled sites"
+            )
+    except Exception as e:
+        log(f"[Google Website Crawl] Enrichment update error: {e}")
 
 
 # ── FB batch processor ────────────────────────────────────────
 
 def _process_and_save_fb_batch(
-    chunk_urls, fb_batch, categories, location_data,
-    zip_code, stats, scrape_run_id, group_name_map,
-    chunk_num, total_chunks, svc_log,
+    chunk_urls,
+    fb_batch,
+    stats,
+    scrape_run_id,
+    group_name_map,
+    chunk_num,
+    total_chunks,
+    svc_log,
 ):
-    from base.models import ScrapedFbGroup, ScrapedFbPost
+    """
+    Deduplicate (via ScrapedFbPost), normalise, save leads, and
+    write ScrapedFbPost records for this chunk.
+    No category or location required — FB posts are self-contained.
+    """
+    from base.models import ScrapedFbPost
 
     chunk_names = ", ".join(group_name_map.get(u, u) for u in chunk_urls[:3])
     if len(chunk_urls) > 3:
-        chunk_names += f" (+{len(chunk_urls)-3})"
+        chunk_names += f" (+{len(chunk_urls) - 3})"
 
-    _log(scrape_run_id,
-         f"Facebook — chunk {chunk_num}/{total_chunks}",
-         f"Groups: {chunk_names} — {len(fb_batch)} post(s). Deduping + saving...")
-
-    post_urls_in_batch = [
-        item.get("url") or item.get("postUrl") or item.get("link") or ""
-        for item in fb_batch
-    ]
-    already_seen = set(
-        ScrapedFbPost.objects.filter(
-            post_url__in=[u for u in post_urls_in_batch if u]
-        ).values_list("post_url", flat=True)
+    _log(
+        scrape_run_id,
+        f"Facebook — chunk {chunk_num}/{total_chunks}",
+        f"Groups: {chunk_names} — {len(fb_batch)} post(s). Deduping + saving…",
     )
-    fresh_items = [
-        item for item, url in zip(fb_batch, post_urls_in_batch)
-        if not url or url not in already_seen
-    ]
+
+    def _item_url(item: dict) -> str:
+        return (
+            item.get("url")
+            or item.get("postUrl")
+            or item.get("permalink")
+            or item.get("link")
+            or item.get("postLink")
+            or ""
+        )
+
+    all_urls = [u for u in (_item_url(i) for i in fb_batch) if u]
+
+    already_seen: set[str] = set(
+        ScrapedFbPost.objects.filter(post_url__in=all_urls)
+        .values_list("post_url", flat=True)
+    ) if all_urls else set()
+
+    fresh_items = []
+    for item in fb_batch:
+        url = _item_url(item)
+        if url and url in already_seen:
+            continue
+        fresh_items.append(item)
+
     dupe_count = len(fb_batch) - len(fresh_items)
     if dupe_count:
-        _log(scrape_run_id,
-             f"Facebook — post dedup (chunk {chunk_num})",
-             f"{dupe_count} already saved — skipped. "
-             f"{len(fresh_items)} new post(s) to process.",
-             level="info")
-
-    normalized = [
-        normalize_facebook(
-            item,
-            categories[0] if categories else "general",
-            location_data["display"] if location_data else "",
-            zip_code=zip_code,
+        _log(
+            scrape_run_id,
+            f"Facebook — post dedup (chunk {chunk_num})",
+            f"{dupe_count} already saved — skipped. "
+            f"{len(fresh_items)} new post(s) to process.",
         )
+
+    # Normalise with no category or location — both default to ""
+    normalized = [
+        normalize_facebook(item, service_category="", location_str="")
         for item in fresh_items
     ]
+
+    # ── Save immediately so data is never lost ────────────────
     _save_lead_batch(normalized, stats, scrape_run_id)
 
+    # ── Write ScrapedFbPost records right after saving ────────
     new_post_records = []
-    for item, url in zip(fb_batch, post_urls_in_batch):
-        if url and url not in already_seen:
-            group_url_for_post = (
-                item.get("groupUrl") or item.get("group_url")
-                or (chunk_urls[0] if chunk_urls else "")
-            )
-            new_post_records.append(
-                ScrapedFbPost(post_url=url, group_url=group_url_for_post)
-            )
-    if new_post_records:
-        ScrapedFbPost.objects.bulk_create(
-            new_post_records, ignore_conflicts=True
+    for item in fresh_items:
+        url = _item_url(item)
+        if not url:
+            continue
+        group_url_for_post = (
+            item.get("groupUrl")
+            or item.get("group_url")
+            or item.get("inputUrl")
+            or item.get("input_url")
+            or (chunk_urls[0] if len(chunk_urls) == 1 else "")
+        )
+        new_post_records.append(
+            ScrapedFbPost(post_url=url, group_url=group_url_for_post)
         )
 
-    _log(scrape_run_id,
-         f"Facebook — chunk {chunk_num} saved",
-         f"{len(normalized)} new post(s) saved — "
-         f"{stats['leads_saved']} total, {stats['leads_skipped']} duplicate(s).",
-         level="success")
+    if new_post_records:
+        ScrapedFbPost.objects.bulk_create(new_post_records, ignore_conflicts=True)
+
+    _log(
+        scrape_run_id,
+        f"Facebook — chunk {chunk_num} saved",
+        f"{len(fb_batch)} retrieved → {len(fresh_items)} fresh → "
+        f"{stats['leads_saved']} total saved, {stats['leads_skipped']} duplicate(s).",
+        level="success",
+    )
 
 
 # ── Main pipeline ─────────────────────────────────────────────
@@ -247,13 +357,10 @@ def run_pipeline(
     categories,
     sources,
     scrape_run_id=None,
-    max_groups=20,
     max_posts_per_group=50,
-    fb_custom_keywords=None,
     fb_group_urls=None,
-    # Google-specific settings
-    google_max_pages=3,         # pages per query (~10 results each)
-    google_deep_scrape=True,    # crawl contractor websites for contacts
+    google_max_pages=3,
+    google_deep_scrape=True,
 ):
     from base.models import ScrapeRun
 
@@ -262,8 +369,10 @@ def run_pipeline(
 
     # ── Step 1: Resolve location ──────────────────────────────
     if location_value:
-        _log(scrape_run_id, "Resolving location",
-             f"Looking up '{location_value}' ({location_type})...")
+        _log(
+            scrape_run_id, "Resolving location",
+            f"Looking up '{location_value}' ({location_type})…",
+        )
         try:
             location_data = resolve_location(location_type, location_value)
         except LocationResolutionError as e:
@@ -272,39 +381,50 @@ def run_pipeline(
             _mark_run_failed(scrape_run_id, str(e))
             return stats
 
-        cl_cities   = location_data["craigslist_cities"]
-        zip_code    = location_data.get("zip_code")
-        fb_location = None if zip_code else location_data["facebook_location_str"]
-        zip_note    = (
-            f" (ZIP: {zip_code} — Facebook will search nationally)"
-            if zip_code else ""
+        cl_cities = location_data["craigslist_cities"]
+        zip_code  = location_data.get("zip_code")
+
+        _log(
+            scrape_run_id, "Location resolved",
+            f"{location_data['display']} — {len(cl_cities)} Craigslist region(s)",
+            level="success",
         )
-        _log(scrape_run_id, "Location resolved",
-             f"{location_data['display']}{zip_note} — "
-             f"{len(cl_cities)} Craigslist region(s)",
-             level="success")
     else:
         location_data = None
         cl_cities     = []
         zip_code      = None
-        fb_location   = None
-        _log(scrape_run_id, "Location",
-             "No location set — Facebook-only run.", level="info")
+        _log(
+            scrape_run_id, "Location",
+            "No location set — Facebook-only run.", level="info",
+        )
 
-    # ── Step 2: Resolve categories ────────────────────────────
-    cl_codes    = get_craigslist_codes(categories)
-    fb_keywords = get_facebook_keywords(categories)
-    _log(scrape_run_id, "Categories mapped",
-         f"{', '.join(categories)} → {len(cl_codes)} CL code(s), "
-         f"{len(fb_keywords)} FB keyword(s)")
+    # ── Step 2: Resolve categories (only needed for CL / Google) ─
+    cl_codes = get_craigslist_codes(categories) if categories else []
+    if categories:
+        _log(
+            scrape_run_id, "Categories mapped",
+            f"{', '.join(categories)} → {len(cl_codes)} CL code(s)",
+        )
 
     # ── Step 3: Craigslist ────────────────────────────────────
     if "craigslist" in sources and cl_cities and cl_codes:
         total_batches = -(-len(cl_cities) // 3)
-        _log(scrape_run_id, "Craigslist — starting",
-             f"Scraping {len(cl_cities)} region(s) across {len(cl_codes)} "
-             f"categor{'y' if len(cl_codes) == 1 else 'ies'} "
-             f"in ~{total_batches} batch(es).")
+        _log(
+            scrape_run_id, "Craigslist — starting",
+            f"Scraping {len(cl_cities)} region(s) across {len(cl_codes)} "
+            f"categor{'y' if len(cl_codes) == 1 else 'ies'} "
+            f"in ~{total_batches} batch(es).",
+        )
+
+        try:
+            from base.models import ServiceLead
+            existing_cl_ids = set(
+                ServiceLead.objects.filter(source="CRAIGSLIST")
+                .values_list("post_id", flat=True)
+            )
+        except Exception:
+            existing_cl_ids = set()
+
         batch_num = 0
         try:
             for batch_items in scrape_craigslist_progressive(
@@ -313,351 +433,110 @@ def run_pipeline(
                 _log_fn=svc_log,
             ):
                 batch_num += 1
-                _log(scrape_run_id,
-                     f"Craigslist — batch {batch_num}/{total_batches}",
-                     f"Received {len(batch_items)} listing(s). Saving...")
+                fresh = [
+                    item for item in batch_items
+                    if str(item.get("id") or "") not in existing_cl_ids
+                ]
+                skipped_known = len(batch_items) - len(fresh)
+                if skipped_known:
+                    stats["leads_skipped"] += skipped_known
+
+                _log(
+                    scrape_run_id,
+                    f"Craigslist — batch {batch_num}/{total_batches}",
+                    f"Received {len(batch_items)} listing(s) "
+                    f"({len(fresh)} new). Saving…",
+                )
+
                 normalized = [
                     normalize_craigslist(
                         item, categories[0] if categories else "general"
                     )
-                    for item in batch_items
+                    for item in fresh
                 ]
                 _save_lead_batch(normalized, stats, scrape_run_id)
-                _log(scrape_run_id,
-                     f"Craigslist — batch {batch_num} saved",
-                     f"{len(normalized)} processed — "
-                     f"{stats['leads_saved']} saved, "
-                     f"{stats['leads_skipped']} duplicate(s).",
-                     level="success")
-            _log(scrape_run_id, "Craigslist — complete",
-                 f"All {batch_num} batch(es) done. "
-                 f"{stats['leads_saved']} lead(s) saved.",
-                 level="success")
+
+                for item in fresh:
+                    pid = str(item.get("id") or "")
+                    if pid:
+                        existing_cl_ids.add(pid)
+
+                _log(
+                    scrape_run_id,
+                    f"Craigslist — batch {batch_num} saved",
+                    f"{len(normalized)} processed — "
+                    f"{stats['leads_saved']} saved, "
+                    f"{stats['leads_skipped']} duplicate(s).",
+                    level="success",
+                )
+
+            _log(
+                scrape_run_id, "Craigslist — complete",
+                f"All {batch_num} batch(es) done. "
+                f"{stats['leads_saved']} lead(s) saved.",
+                level="success",
+            )
+
         except Exception as e:
             _log(scrape_run_id, "Craigslist — error", str(e), level="error")
             stats["errors"].append(f"Craigslist: {str(e)}")
 
     elif "craigslist" in sources:
-        _log(scrape_run_id, "Craigslist — skipped",
-             "No matching regions or category codes for this location.",
-             level="warning")
+        _log(
+            scrape_run_id, "Craigslist — skipped",
+            "No matching regions or category codes for this location.",
+            level="warning",
+        )
 
-    # ── Step 4: Facebook ──────────────────────────────────────
-    manual_group_urls = [u.strip() for u in (fb_group_urls or []) if u.strip()]
-    has_fb_keywords   = bool(fb_keywords or fb_custom_keywords)
+    # ── Step 4: Facebook (manual groups only) ─────────────────
+    if "facebook" in sources:
+        manual_group_urls = [u.strip() for u in (fb_group_urls or []) if u.strip()]
 
-    if "facebook" in sources and (has_fb_keywords or manual_group_urls):
-        from base.models import ScrapedFbGroup, ScrapedFbPost
-
-        all_fb_keywords = list(fb_keywords)
-        for kw in (fb_custom_keywords or []):
-            if kw and kw not in all_fb_keywords:
-                all_fb_keywords.append(kw)
-        fb_keywords = all_fb_keywords
-
-        try:
-            if manual_group_urls:
-                discovered_urls = manual_group_urls
-                _log(scrape_run_id, "Facebook — manual groups",
-                     f"Using {len(manual_group_urls)} manually specified group URL(s).",
-                     level="success")
-            else:
-                if _cancelled(scrape_run_id):
-                    raise Exception("Cancelled by user")
-                custom_note = (
-                    f" + {len(fb_custom_keywords)} custom term(s)"
-                    if fb_custom_keywords else ""
-                )
-                _log(scrape_run_id, "Facebook — searching for groups",
-                     f"Querying {len(fb_keywords)} keyword(s){custom_note} "
-                     + (f"near '{fb_location}'" if fb_location else "nationally")
-                     + " to discover groups...")
-                discovered_urls = find_facebook_groups(
-                    fb_keywords, fb_location,
-                    max_groups=max_groups,
-                    scrape_run_id=scrape_run_id,
-                    _log_fn=svc_log,
-                )
-
-            if not discovered_urls:
-                hint = f"near '{fb_location}'" if fb_location else "nationally"
-                _log(scrape_run_id, "Facebook — no groups found",
-                     f"No groups found {hint}. Try different categories "
-                     f"or add group URLs manually.",
-                     level="warning")
-                stats["errors"].append("Facebook: No groups found.")
-            else:
-                def _slug(u):
-                    import re as _re
-                    m = _re.search(r"/groups/([^/?#]+)", u or "")
-                    slug = m.group(1) if m else (u.rstrip("/").split("/")[-1])
-                    slug = _re.sub(r"([a-z])([A-Z])", r"\1 \2", slug)
-                    slug = _re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", slug)
-                    slug = _re.sub(r"[-_]", " ", slug)
-                    return _re.sub(r"\s+", " ", slug).strip().title() or u
-
-                stored_names = {
-                    obj["group_url"]: obj["group_name"]
-                    for obj in ScrapedFbGroup.objects.filter(
-                        group_url__in=discovered_urls
-                    ).values("group_url", "group_name")
-                    if obj["group_name"]
-                }
-                group_name_map = {
-                    url: stored_names.get(url) or _slug(url)
-                    for url in discovered_urls
-                }
-                previously = set(
-                    ScrapedFbGroup.objects.filter(
-                        group_url__in=discovered_urls
-                    ).values_list("group_url", flat=True)
-                )
-                new_count  = sum(1 for u in discovered_urls if u not in previously)
-                seen_count = len(previously)
-                if seen_count:
-                    _log(scrape_run_id, "Facebook — group info",
-                         f"{seen_count} previously scraped group(s) will be "
-                         f"re-scraped for new posts. "
-                         f"{new_count} brand-new group(s) also queued.",
-                         level="info")
-
-                names_preview = ", ".join(list(group_name_map.values())[:8])
-                if len(discovered_urls) > 8:
-                    names_preview += f" (+{len(discovered_urls)-8} more)"
-                _log(scrape_run_id, "Facebook — groups to scrape",
-                     f"Scraping {len(discovered_urls)} group(s): {names_preview}",
-                     level="success")
-
-                chunk_size   = 5
-                total_chunks = -(-len(discovered_urls) // chunk_size)
-                chunk_num    = 0
-
-                for chunk_urls, fb_batch in scrape_facebook_groups_progressive(
-                    discovered_urls,
-                    max_posts_per_group=max_posts_per_group,
-                    scrape_run_id=scrape_run_id,
-                    _log_fn=svc_log,
-                ):
-                    chunk_num += 1
-                    _process_and_save_fb_batch(
-                        chunk_urls=chunk_urls, fb_batch=fb_batch,
-                        categories=categories, location_data=location_data,
-                        zip_code=zip_code, stats=stats,
-                        scrape_run_id=scrape_run_id,
-                        group_name_map=group_name_map,
-                        chunk_num=chunk_num, total_chunks=total_chunks,
-                        svc_log=svc_log,
-                    )
-                    if _cancelled(scrape_run_id):
-                        _log(scrape_run_id, "Facebook — cancelled",
-                             f"Cancelled after saving chunk {chunk_num}. "
-                             f"{stats['leads_saved']} lead(s) saved so far.",
-                             level="warning")
-                        break
-
-                for url in discovered_urls:
-                    ScrapedFbGroup.objects.update_or_create(
-                        group_url=url,
-                        defaults={
-                            "group_name": group_name_map.get(url, ""),
-                            "post_count": ScrapedFbPost.objects.filter(
-                                group_url=url
-                            ).count(),
-                        },
-                    )
-                _log(scrape_run_id, "Facebook — complete",
-                     f"All {chunk_num} chunk(s) done across "
-                     f"{len(discovered_urls)} group(s). "
-                     f"{stats['leads_saved']} total lead(s) saved.",
-                     level="success")
-
-        except Exception as e:
-            _log(scrape_run_id, "Facebook — error", str(e), level="error")
-            stats["errors"].append(f"Facebook: {str(e)}")
-
-    elif "facebook" in sources:
-        _log(scrape_run_id, "Facebook — skipped",
-             "No Facebook keywords configured for the selected categories.",
-             level="warning")
-
-    # ── Step 5: Indeed ────────────────────────────────────────
-    if "indeed" in sources:
-        if not location_data:
-            _log(scrape_run_id, "Indeed — skipped",
-                 "No location set — Indeed requires a location.",
-                 level="warning")
-        else:
-            indeed_position = " ".join(
-                INDEED_CATEGORY_TERMS.get(c, c) for c in categories
-            ).strip() or "contractor"
-            indeed_location = (
-                location_data.get("facebook_location_str")
-                or location_data.get("display", "")
+        if not manual_group_urls:
+            _log(
+                scrape_run_id, "Facebook — skipped",
+                "No group URLs provided. Add group URLs to scrape Facebook.",
+                level="warning",
             )
-            _log(scrape_run_id, "Indeed — starting",
-                 f"Searching Indeed for '{indeed_position}' "
-                 f"near '{indeed_location}'...")
+        elif _cancelled(scrape_run_id):
+            _log(
+                scrape_run_id, "Facebook — skipped",
+                "Cancelled before Facebook could start.", level="warning",
+            )
+        else:
+            _run_facebook_pipeline(
+                manual_group_urls=manual_group_urls,
+                max_posts_per_group=max_posts_per_group,
+                stats=stats,
+                scrape_run_id=scrape_run_id,
+                svc_log=svc_log,
+            )
 
-            if _cancelled(scrape_run_id):
-                _log(scrape_run_id, "Indeed — skipped",
-                     "Cancelled before Indeed could start.", level="warning")
-            else:
-                batch_num = 0
-                try:
-                    for batch_items in scrape_indeed_progressive(
-                        position=indeed_position,
-                        location=indeed_location,
-                        country="US",
-                        scrape_run_id=scrape_run_id,
-                        _log_fn=svc_log,
-                    ):
-                        batch_num += 1
-                        _log(scrape_run_id,
-                             f"Indeed — batch {batch_num}",
-                             f"Received {len(batch_items)} listing(s). Saving...")
-                        normalized = [
-                            normalize_indeed(
-                                item,
-                                categories[0] if categories else "general",
-                                indeed_location,
-                            )
-                            for item in batch_items
-                        ]
-                        _save_lead_batch(normalized, stats, scrape_run_id)
-                        _log(scrape_run_id,
-                             f"Indeed — batch {batch_num} saved",
-                             f"{len(normalized)} processed — "
-                             f"{stats['leads_saved']} total saved, "
-                             f"{stats['leads_skipped']} duplicate(s).",
-                             level="success")
-                        if _cancelled(scrape_run_id):
-                            _log(scrape_run_id, "Indeed — cancelled",
-                                 f"Cancelled after saving batch {batch_num}. "
-                                 f"{stats['leads_saved']} lead(s) saved so far.",
-                                 level="warning")
-                            break
-
-                    if batch_num > 0:
-                        _log(scrape_run_id, "Indeed — complete",
-                             f"All {batch_num} batch(es) done. "
-                             f"{stats['leads_saved']} total lead(s) saved.",
-                             level="success")
-                    else:
-                        _log(scrape_run_id, "Indeed — no results",
-                             "Actor returned 0 results for this search.",
-                             level="warning")
-                except Exception as e:
-                    _log(scrape_run_id, "Indeed — error", str(e), level="error")
-                    stats["errors"].append(f"Indeed: {str(e)}")
-
-    # ── Step 6: Google Search ─────────────────────────────────
+    # ── Step 5: Google Search ─────────────────────────────────
     if "google" in sources:
         if not location_data:
-            _log(scrape_run_id, "Google Search — skipped",
-                 "No location set — Google Search requires a location.",
-                 level="warning")
+            _log(
+                scrape_run_id, "Google Search — skipped",
+                "No location set — Google Search requires a location.",
+                level="warning",
+            )
+        elif _cancelled(scrape_run_id):
+            _log(
+                scrape_run_id, "Google Search — skipped",
+                "Cancelled before Google Search could start.", level="warning",
+            )
         else:
-            # One deduplicated query per selected category
-            seen_q         = set()
-            google_queries = []
-            for c in categories:
-                q = GOOGLE_CATEGORY_QUERIES.get(c, f"{c} contractor")
-                if q not in seen_q:
-                    seen_q.add(q)
-                    google_queries.append(q)
-
-            google_location = (
-                location_data.get("facebook_location_str")
-                or location_data.get("display", "")
+            _run_google_pipeline(
+                categories=categories,
+                location_data=location_data,
+                google_max_pages=google_max_pages,
+                google_deep_scrape=google_deep_scrape,
+                stats=stats,
+                scrape_run_id=scrape_run_id,
+                svc_log=svc_log,
             )
 
-            approx_results = google_max_pages * 10 * len(google_queries)
-            _log(scrape_run_id, "Google Search — starting",
-                 f"{len(google_queries)} "
-                 f"quer{'y' if len(google_queries) == 1 else 'ies'} × "
-                 f"{google_max_pages} page(s) ≈ {approx_results} results near "
-                 f"'{google_location}'"
-                 + (" + website deep-scrape" if google_deep_scrape else "")
-                 + " + all AI modes + leads enrichment...")
-
-            if _cancelled(scrape_run_id):
-                _log(scrape_run_id, "Google Search — skipped",
-                     "Cancelled before Google Search could start.",
-                     level="warning")
-            else:
-                query_num = 0
-                try:
-                    for result_bundle in scrape_google_search_progressive(
-                        queries=google_queries,
-                        location=google_location,
-                        max_pages=google_max_pages,
-                        enrich_leads=True,
-                        deep_scrape_sites=google_deep_scrape,
-                        scrape_run_id=scrape_run_id,
-                        _log_fn=svc_log,
-                    ):
-                        query_num += 1
-                        serp_pages   = result_bundle.get("serp_pages", [])
-                        contacts_map = result_bundle.get("contacts_map", {})
-
-                        all_leads = []
-                        for page in serp_pages:
-                            page_leads = normalize_google_serp_page(
-                                page,
-                                categories[0] if categories else "general",
-                                google_location,
-                                contacts_map=contacts_map,
-                            )
-                            all_leads.extend(page_leads)
-
-                        if not all_leads:
-                            _log(scrape_run_id,
-                                 f"Google Search — query {query_num} empty",
-                                 "No usable leads extracted from SERP pages.",
-                                 level="warning")
-                            continue
-
-                        _log(scrape_run_id,
-                             f"Google Search — query {query_num} saving",
-                             f"{len(all_leads)} lead(s) from "
-                             f"{len(serp_pages)} SERP page(s)"
-                             + (f" + {len(contacts_map)} site(s) crawled"
-                                if contacts_map else "")
-                             + ". Saving...")
-
-                        _save_lead_batch(all_leads, stats, scrape_run_id)
-
-                        _log(scrape_run_id,
-                             f"Google Search — query {query_num} saved",
-                             f"{len(all_leads)} processed — "
-                             f"{stats['leads_saved']} total saved, "
-                             f"{stats['leads_skipped']} duplicate(s).",
-                             level="success")
-
-                        if _cancelled(scrape_run_id):
-                            _log(scrape_run_id, "Google Search — cancelled",
-                                 f"Cancelled after query {query_num}. "
-                                 f"{stats['leads_saved']} lead(s) saved so far.",
-                                 level="warning")
-                            break
-
-                    if query_num > 0:
-                        _log(scrape_run_id, "Google Search — complete",
-                             f"All {query_num} "
-                             f"quer{'y' if query_num == 1 else 'ies'} done. "
-                             f"{stats['leads_saved']} total lead(s) saved.",
-                             level="success")
-                    else:
-                        _log(scrape_run_id, "Google Search — no results",
-                             "Actor returned 0 results for all queries.",
-                             level="warning")
-
-                except Exception as e:
-                    _log(scrape_run_id, "Google Search — error",
-                         str(e), level="error")
-                    stats["errors"].append(f"Google Search: {str(e)}")
-
-    # ── Step 7: Wrap up ───────────────────────────────────────
+    # ── Step 6: Wrap up ───────────────────────────────────────
     if scrape_run_id:
         try:
             run = ScrapeRun.objects.get(pk=scrape_run_id)
@@ -675,9 +554,264 @@ def run_pipeline(
         f"{stats['leads_skipped']} duplicate(s) skipped"
         + (f", {len(stats['errors'])} error(s)" if stats["errors"] else "")
     )
-    _log(scrape_run_id, "Finished", summary,
-         level="success" if not stats["errors"] else "warning")
+    _log(
+        scrape_run_id, "Finished", summary,
+        level="success" if not stats["errors"] else "warning",
+    )
     return stats
+
+
+# ── Facebook sub-pipeline (manual groups only) ────────────────
+
+def _run_facebook_pipeline(
+    *,
+    manual_group_urls,
+    max_posts_per_group,
+    stats,
+    scrape_run_id,
+    svc_log,
+):
+    """
+    Scrapes posts from the supplied manual group URLs.
+    Completely independent of categories and location.
+    """
+    # Normalise URLs
+    all_group_urls: list[str] = []
+    seen: set[str] = set()
+    for url in manual_group_urls:
+        url = url.strip().rstrip("/") + "/"
+        if url and url not in seen:
+            seen.add(url)
+            all_group_urls.append(url)
+
+    if not all_group_urls:
+        _log(
+            scrape_run_id, "Facebook — no groups to scrape",
+            "No valid group URLs after normalisation.",
+            level="warning",
+        )
+        return
+
+    _log(
+        scrape_run_id, "Facebook — posts starting",
+        f"Scraping posts from {len(all_group_urls)} group(s) "
+        f"(up to {max_posts_per_group} posts/group, "
+        f"already-scraped posts will be skipped)…",
+    )
+
+    # Build group name lookup for nice log messages
+    group_name_map: dict[str, str] = {}
+    try:
+        from base.models import ScrapedFbGroup
+        for grp in ScrapedFbGroup.objects.filter(
+            group_url__in=all_group_urls
+        ).values("group_url", "group_name"):
+            group_name_map[grp["group_url"]] = grp["group_name"] or grp["group_url"]
+    except Exception:
+        pass
+
+    total_chunks = -(-len(all_group_urls) // 5)  # ceil(n/5)
+    chunk_num    = 0
+
+    try:
+        for batch_posts in scrape_fb_groups_progressive(
+            group_urls=all_group_urls,
+            max_posts_per_group=max_posts_per_group,
+            scrape_run_id=scrape_run_id,
+            log=svc_log,
+        ):
+            chunk_num += 1
+
+            if not batch_posts:
+                _log(
+                    scrape_run_id,
+                    f"Facebook — chunk {chunk_num} empty",
+                    "Actor returned no posts for this batch.",
+                    level="warning",
+                )
+                continue
+
+            chunk_urls_set: set[str] = set()
+            for post in batch_posts:
+                g_url = (
+                    post.get("inputUrl")
+                    or post.get("facebookUrl")
+                    or ""
+                ).rstrip("/") + "/"
+                if g_url and g_url != "/":
+                    chunk_urls_set.add(g_url)
+            chunk_urls = list(chunk_urls_set) if chunk_urls_set else all_group_urls
+
+            _process_and_save_fb_batch(
+                chunk_urls=chunk_urls,
+                fb_batch=batch_posts,
+                stats=stats,
+                scrape_run_id=scrape_run_id,
+                group_name_map=group_name_map,
+                chunk_num=chunk_num,
+                total_chunks=total_chunks,
+                svc_log=svc_log,
+            )
+
+            if _cancelled(scrape_run_id):
+                _log(
+                    scrape_run_id, "Facebook — cancelled",
+                    f"Cancelled after chunk {chunk_num}. "
+                    f"{stats['leads_saved']} lead(s) saved.",
+                    level="warning",
+                )
+                return
+
+        _log(
+            scrape_run_id, "Facebook — complete",
+            f"All {chunk_num} chunk(s) processed. "
+            f"{stats['leads_saved']} total lead(s) saved.",
+            level="success",
+        )
+
+    except Exception as e:
+        _log(scrape_run_id, "Facebook — error", str(e), level="error")
+        stats["errors"].append(f"Facebook: {str(e)}")
+
+
+# ── Google sub-pipeline ───────────────────────────────────────
+
+def _run_google_pipeline(
+    *,
+    categories,
+    location_data,
+    google_max_pages,
+    google_deep_scrape,
+    stats,
+    scrape_run_id,
+    svc_log,
+):
+    try:
+        from base.models import ServiceLead
+        existing_google_urls = set(
+            ServiceLead.objects.filter(source="GOOGLE")
+            .values_list("url", flat=True)
+        )
+    except Exception:
+        existing_google_urls = set()
+
+    seen_q: set[str] = set()
+    google_queries: list[str] = []
+    for c in categories:
+        q = GOOGLE_CATEGORY_QUERIES.get(c, f"{c} contractor")
+        if q not in seen_q:
+            seen_q.add(q)
+            google_queries.append(q)
+
+    google_location = (
+        location_data.get("facebook_location_str")
+        or location_data.get("display", "")
+    )
+
+    approx_results = google_max_pages * 10 * len(google_queries)
+    _log(
+        scrape_run_id, "Google Search — starting",
+        f"{len(google_queries)} "
+        f"quer{'y' if len(google_queries) == 1 else 'ies'} × "
+        f"{google_max_pages} page(s) ≈ {approx_results} results near "
+        f"'{google_location}'"
+        + (" + website deep-scrape" if google_deep_scrape else "")
+        + " + AI modes + leads enrichment…",
+    )
+
+    query_num = 0
+    try:
+        for result_bundle in scrape_google_search_progressive(
+            queries=google_queries,
+            location=google_location,
+            max_pages=google_max_pages,
+            enrich_leads=True,
+            deep_scrape_sites=google_deep_scrape,
+            scrape_run_id=scrape_run_id,
+            _log_fn=svc_log,
+            enrich_callback=lambda cm: _enrich_saved_google_leads(
+                cm, scrape_run_id, svc_log
+            ),
+        ):
+            query_num += 1
+
+            serp_pages   = result_bundle.get("serp_pages", [])
+            contacts_map = result_bundle.get("contacts_map", {})
+
+            all_leads = []
+            for page in serp_pages:
+                page_leads = normalize_google_serp_page(
+                    page,
+                    categories[0] if categories else "general",
+                    google_location,
+                    contacts_map=contacts_map,
+                )
+                for lead in page_leads:
+                    url = lead.get("url", "")
+                    if url and url in existing_google_urls:
+                        stats["leads_skipped"] += 1
+                        continue
+                    all_leads.append(lead)
+                    if url:
+                        existing_google_urls.add(url)
+
+            if not all_leads:
+                _log(
+                    scrape_run_id,
+                    f"Google Search — query {query_num} empty",
+                    "No new leads extracted from SERP pages.",
+                    level="warning",
+                )
+                continue
+
+            _log(
+                scrape_run_id,
+                f"Google Search — query {query_num} saving",
+                f"{len(all_leads)} new lead(s) from "
+                f"{len(serp_pages)} SERP page(s). Saving now…",
+            )
+
+            _save_lead_batch(all_leads, stats, scrape_run_id)
+
+            _log(
+                scrape_run_id,
+                f"Google Search — query {query_num} saved",
+                f"{len(all_leads)} processed — "
+                f"{stats['leads_saved']} total saved, "
+                f"{stats['leads_skipped']} duplicate(s).",
+                level="success",
+            )
+
+            if contacts_map:
+                _enrich_saved_google_leads(contacts_map, scrape_run_id, svc_log)
+
+            if _cancelled(scrape_run_id):
+                _log(
+                    scrape_run_id, "Google Search — cancelled",
+                    f"Cancelled after query {query_num}. "
+                    f"{stats['leads_saved']} lead(s) saved so far.",
+                    level="warning",
+                )
+                return
+
+        if query_num > 0:
+            _log(
+                scrape_run_id, "Google Search — complete",
+                f"All {query_num} "
+                f"quer{'y' if query_num == 1 else 'ies'} done. "
+                f"{stats['leads_saved']} total lead(s) saved.",
+                level="success",
+            )
+        else:
+            _log(
+                scrape_run_id, "Google Search — no results",
+                "Actor returned 0 results for all queries.",
+                level="warning",
+            )
+
+    except Exception as e:
+        _log(scrape_run_id, "Google Search — error", str(e), level="error")
+        stats["errors"].append(f"Google Search: {str(e)}")
 
 
 def _mark_run_failed(scrape_run_id, reason: str):

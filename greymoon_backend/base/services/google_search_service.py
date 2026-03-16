@@ -1,51 +1,46 @@
 """
 google_search_service.py
-Apify actor: apify~google-search-scraper   (SERP)
-Apify actor: apify~website-content-crawler (contact extraction)
 
-How it works
-────────────
-For each search query the pipeline runs TWO actors in parallel:
+Bugs fixed in this version
+──────────────────────────
+1. enrich_callback was never passed into scrape_google_search_progressive
+   from pipeline.py — contacts extracted by the crawler were written into
+   contacts_map but the callback to update already-saved leads was never
+   called.  Fixed: enrich_callback is now wired all the way through.
 
-  ┌─────────────────────────┐     ┌──────────────────────────────┐
-  │  SERP actor             │     │  Website crawler             │
-  │  apify~google-search-   │     │  apify~website-content-      │
-  │  scraper                │     │  crawler                     │
-  │                         │     │                              │
-  │  • Organic results      │     │  • Visits every contractor   │
-  │  • AI Mode answers      │     │    URL found in the SERP     │
-  │  • AI Overviews         │     │  • Also crawls /contact and  │
-  │  • Paid / ad results    │     │    /contact-us variants      │
-  │  • Leads enrichment     │     │  • Renders full JS via       │
-  │    (email/phone/LinkedIn│     │    Playwright so dynamically │
-  │     from enrichment DB) │     │    loaded phone numbers are  │
-  └─────────────────────────┘     │    visible                   │
-           both launched          │  • Saves contacts per-site   │
-           at the same time       │    immediately — no data lost│
-                                  │    if the run is cancelled   │
-                                  └──────────────────────────────┘
+2. Phone regex missed dot-separated numbers (555.123.4567) which are
+   extremely common on contractor websites.  Also missed bare 10-digit
+   numbers in href="tel:5551234567" links (the most reliable contact
+   signal on modern sites).  Fixed: three-pattern extraction approach.
 
-The generator yields one bundle per query:
-  { "serp_pages": [...], "contacts_map": { "https://domain.com": { phones, emails } } }
+3. maxCrawlPagesPerCrawl was hard-coded to 5 but each batch sends up to
+   15 URLs (root + /contact + /contact-us per site × 5 sites).  Only
+   the first 5 pages were ever fetched — /contact pages were silently
+   skipped.  Fixed: maxCrawlPagesPerCrawl = len(urls) * 3.
 
-The pipeline normaliser merges SERP results with contacts_map so every
-lead gets the best available phone/email regardless of which source
-provided it.
+4. contacts_map keys are base-domain strings like "https://www.example.com"
+   but _enrich_saved_google_leads matched via url__startswith.  If a saved
+   lead had www. and the crawled page key didn't (or vice versa) the match
+   failed silently.  Fixed: normalise both sides by stripping www. before
+   storing/comparing.
 """
 
 import threading
 import time
 import re
 import requests
+
 from django.conf import settings
 
 # ── Actor IDs ─────────────────────────────────────────────────
 SERP_ACTOR_ID       = "apify~google-search-scraper"
 CRAWL_ACTOR_ID      = "apify~website-content-crawler"
 
-POLL_INTERVAL       = 5     # seconds between status checks
-DATASET_FETCH_LIMIT = 500   # max items fetched from any single dataset
-DEFAULT_MAX_PAGES   = 3     # SERP pages per query (~10 results each)
+POLL_INTERVAL       = 5
+DATASET_FETCH_LIMIT = 500
+DEFAULT_MAX_PAGES   = 3
+CRAWL_TIMEOUT       = 480   # seconds to wait for crawler per query
+CRAWL_BATCH_SIZE    = 5     # sites per crawler actor run
 
 SKIP_DOMAINS = {
     "yelp.com", "angi.com", "thumbtack.com", "homeadvisor.com",
@@ -54,7 +49,6 @@ SKIP_DOMAINS = {
     "bbb.org", "angieslist.com", "taskrabbit.com", "craigslist.org",
     "nextdoor.com", "google.com", "twitter.com", "x.com",
 }
-
 
 # ── Apify helpers ─────────────────────────────────────────────
 
@@ -101,11 +95,6 @@ def _is_cancel_requested(scrape_run_id) -> bool:
 
 
 def _launch_actor(actor_id: str, payload: dict, scrape_run_id) -> tuple[str, str] | None:
-    """
-    Fire off an Apify actor run.
-    Registers the run ID immediately so cancel can abort it.
-    Returns (run_id, dataset_id) or None if cancelled.
-    """
     resp = requests.post(
         f"https://api.apify.com/v2/acts/{actor_id}/runs",
         json=payload,
@@ -133,7 +122,6 @@ def _fetch_dataset(dataset_id: str) -> list[dict]:
 
 
 def _poll_run_status(run_id: str) -> str:
-    """Single status check — returns Apify status string."""
     res = requests.get(
         f"https://api.apify.com/v2/actor-runs/{run_id}",
         headers=_apify_headers(),
@@ -142,31 +130,89 @@ def _poll_run_status(run_id: str) -> str:
     return res.json()["data"]["status"]
 
 
-# ── Contact extraction from crawled page text ─────────────────
+# ── Contact extraction ────────────────────────────────────────
+#
+# Three-pattern approach to maximise coverage on contractor websites:
+#
+#   Pattern 1 — formatted numbers with any separator (-, space, dot):
+#     Covers (555) 123-4567  555-123-4567  555.123.4567  555 123 4567
+#     +1-800-555-1234  1.800.555.1234  (555)123-4567
+#
+#   Pattern 2 — href="tel:" with formatted number:
+#     Covers <a href="tel:(555)123-4567"> style links.
+#
+#   Pattern 3 — href="tel:" with raw 10-digit number:
+#     Covers <a href="tel:5551234567"> which is the most common way
+#     modern websites embed click-to-call links.  The 10 digits are
+#     reformatted to (NXX) NXX-XXXX for storage consistency.
+#
+# Why not one regex?
+#   A single regex broad enough to catch dots AND bare digits would also
+#   match IP addresses (192.168.1.1), version numbers (3.14.159), and
+#   dates (2024.01.15).  Splitting by context avoids all false positives.
+
+_PHONE_FORMATTED = re.compile(
+    r'(\+?1?[\s\.\-]?[\(\-]?\d{3}[\)\.\-\s][\.\-\s]?\d{3}[\.\-\s]\d{4})'
+)
+_PHONE_TEL_HREF_FORMATTED = re.compile(
+    r'href=["\']tel:[\+]?1?[\-\s\.]?(\(?\d{3}\)?[\-\s\.]?\d{3}[\-\s\.]\d{4})'
+)
+_PHONE_TEL_HREF_RAW = re.compile(
+    r'href=["\']tel:[\+]?1?(\d{10})["\']'
+)
+_EMAIL_RE = re.compile(
+    r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
+)
+_EMAIL_SKIP = {
+    "noreply", "no-reply", ".png", ".jpg", ".gif", ".svg",
+    ".css", ".js", "example.com", "sentry.io",
+    "wixpress.com", "squarespace.com", "wordpress.com",
+}
+
 
 def _extract_contacts(text: str) -> dict:
-    """Return { phones: [...], emails: [...] } found in page text."""
+    """
+    Extract phone numbers and email addresses from crawled page text.
+    Returns {"phones": [...], "emails": [...]}.
+    """
     if not text:
         return {"phones": [], "emails": []}
-    phones = list(dict.fromkeys(
-        m.strip() for m in re.findall(
-            r"(\+?1?\s?[\(\-]?\d{3}[\)\-\s]?\s?\d{3}[\-\s]?\d{4})", text
-        )
+
+    # Pattern 1: formatted numbers — dashes, spaces, or dots as separators
+    phones_formatted = [m.strip() for m in _PHONE_FORMATTED.findall(text)]
+
+    # Pattern 2: tel: href with formatted number (most reliable, check first)
+    phones_tel_fmt = _PHONE_TEL_HREF_FORMATTED.findall(text)
+
+    # Pattern 3: tel: href with raw 10 digits — reformat to (NXX) NXX-XXXX
+    phones_tel_raw = [
+        f"({d[:3]}) {d[3:6]}-{d[6:]}"
+        for d in _PHONE_TEL_HREF_RAW.findall(text)
+    ]
+
+    # Merge — tel: href results first (most reliable source), then formatted
+    all_phones = list(dict.fromkeys(
+        phones_tel_fmt + phones_tel_raw + phones_formatted
     ))
+
     emails = list(dict.fromkeys(
-        m.lower() for m in re.findall(
-            r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", text
-        )
-        if not any(x in m.lower() for x in [
-            "noreply", "no-reply", ".png", ".jpg", ".gif",
-            ".svg", ".css", ".js", "example.com", "sentry.io",
-        ])
+        m.lower() for m in _EMAIL_RE.findall(text)
+        if not any(skip in m.lower() for skip in _EMAIL_SKIP)
     ))
-    return {"phones": phones[:5], "emails": emails[:5]}
+
+    return {"phones": all_phones[:5], "emails": emails[:5]}
+
+
+def _normalise_domain(base_url: str) -> str:
+    """
+    Strip www. so https://www.example.com and https://example.com
+    both map to the same contacts_map key.
+    """
+    return base_url.replace("://www.", "://")
 
 
 def _base_domain(url: str) -> str:
-    """https://www.buizawaste.com/about → https://www.buizawaste.com"""
+    """https://www.example.com/about  →  https://www.example.com"""
     try:
         parts = url.split("/")
         return f"{parts[0]}//{parts[2]}"
@@ -203,8 +249,13 @@ def build_google_payload(
 def build_crawl_payload(urls: list[str]) -> dict:
     """
     Build crawler input for a batch of contractor URLs.
-    Queues the root URL + /contact + /contact-us for every site.
-    Uses Playwright so JavaScript-rendered contact info is visible.
+
+    Queues root + /contact + /contact-us for every site.
+
+    Bug fix: maxCrawlPagesPerCrawl is now len(urls) * 3 instead of the
+    previous hard-coded 5.  With 5 sites per batch = 15 queued URLs,
+    the old limit of 5 meant only root pages were ever fetched and
+    /contact pages were silently dropped.
     """
     start_urls = []
     for u in urls:
@@ -212,9 +263,10 @@ def build_crawl_payload(urls: list[str]) -> dict:
         start_urls.append({"url": u})
         start_urls.append({"url": f"{base}/contact"})
         start_urls.append({"url": f"{base}/contact-us"})
+
     return {
         "startUrls":             start_urls,
-        "maxCrawlPagesPerCrawl": 5,
+        "maxCrawlPagesPerCrawl": len(urls) * 3,   # ← was hard-coded 5
         "maxCrawlDepth":         1,
         "crawlerType":           "playwright:chrome",
         "proxyConfiguration": {
@@ -229,38 +281,47 @@ def build_crawl_payload(urls: list[str]) -> dict:
 
 def _run_crawl_parallel(
     urls_to_crawl: list[str],
-    contacts_map: dict,        # shared dict — written from this thread
+    contacts_map: dict,
     contacts_lock: threading.Lock,
     crawl_done: threading.Event,
+    enrich_callback,        # callable(contacts_map) called after each batch
     scrape_run_id,
     log,
 ):
     """
     Runs in a background thread alongside the SERP actor.
-    Crawls sites one-by-one and writes contacts into contacts_map
-    immediately after each site — so even a cancelled run saves whatever
-    was already extracted.
+    Crawls sites in batches and writes contacts into contacts_map
+    immediately after each batch.  Calls enrich_callback after every
+    batch so pipeline.py can update already-saved leads in real time.
     """
     total = len(urls_to_crawl)
-    log(f"[Google Website Crawl] Starting crawler on {total} contractor site(s) "
-        f"(Playwright + JS rendering, /contact pages included)")
+    log(
+        f"[Google Website Crawl] Starting crawler on {total} contractor site(s) "
+        f"(Playwright + JS rendering, /contact + /contact-us pages included)"
+    )
 
-    # We crawl in small batches of 5 so results are saved progressively
-    BATCH = 5
-    batches = [urls_to_crawl[i:i+BATCH] for i in range(0, total, BATCH)]
+    batches = [
+        urls_to_crawl[i:i + CRAWL_BATCH_SIZE]
+        for i in range(0, total, CRAWL_BATCH_SIZE)
+    ]
 
     for b_idx, batch in enumerate(batches):
         if _is_cancel_requested(scrape_run_id):
-            log(f"[Google Website Crawl] Cancel requested — stopping after batch {b_idx} "
-                f"({b_idx * BATCH} of {total} sites crawled)")
+            log(
+                f"[Google Website Crawl] Cancel requested — stopping after batch {b_idx} "
+                f"({b_idx * CRAWL_BATCH_SIZE} of {total} sites crawled)"
+            )
             break
 
-        batch_domains = ", ".join(u.split("/")[2] for u in batch if len(u.split("/")) > 2)
-        log(f"[Google Website Crawl] Batch {b_idx+1}/{len(batches)} — "
-            f"crawling: {batch_domains}")
+        batch_domains = ", ".join(
+            u.split("/")[2] for u in batch if len(u.split("/")) > 2
+        )
+        log(
+            f"[Google Website Crawl] Batch {b_idx+1}/{len(batches)} — "
+            f"crawling: {batch_domains}"
+        )
 
         payload = build_crawl_payload(batch)
-
         try:
             result = _launch_actor(CRAWL_ACTOR_ID, payload, scrape_run_id)
         except Exception as e:
@@ -272,18 +333,22 @@ def _run_crawl_parallel(
             break
 
         run_id, dataset_id = result
-        log(f"[Google Website Crawl] Batch {b_idx+1} actor running (run {run_id}) — "
-            f"waiting for Playwright to render {len(batch) * 3} page(s)...")
+        expected_pages = len(batch) * 3
+        log(
+            f"[Google Website Crawl] Batch {b_idx+1} actor running (run {run_id}) — "
+            f"waiting for Playwright to render up to {expected_pages} page(s)..."
+        )
 
-        # Poll until done or cancelled
-        finished = False
         poll_count = 0
         while True:
             if _is_cancel_requested(scrape_run_id):
-                log(f"[Google Website Crawl] Cancel detected mid-crawl — "
-                    f"aborting batch {b_idx+1} and saving partial contacts")
+                log(
+                    f"[Google Website Crawl] Cancel detected mid-crawl — "
+                    f"aborting batch {b_idx+1} and saving partial contacts"
+                )
                 _abort_apify_run(run_id)
                 break
+
             try:
                 status = _poll_run_status(run_id)
             except Exception as e:
@@ -292,37 +357,42 @@ def _run_crawl_parallel(
 
             poll_count += 1
             if status == "SUCCEEDED":
-                finished = True
-                log(f"[Google Website Crawl] Batch {b_idx+1} finished — "
-                    f"extracting contacts from crawled pages...")
+                log(
+                    f"[Google Website Crawl] Batch {b_idx+1} finished — "
+                    f"extracting contacts from crawled pages..."
+                )
                 break
             elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
-                log(f"[Google Website Crawl] Batch {b_idx+1} ended with status: {status} — "
-                    f"saving any partial results")
+                log(
+                    f"[Google Website Crawl] Batch {b_idx+1} ended with status: {status} — "
+                    f"saving any partial results"
+                )
                 break
             else:
-                # Log a meaningful progress message every 3 polls (~15 seconds)
                 if poll_count % 3 == 0:
                     elapsed = poll_count * POLL_INTERVAL
-                    log(f"[Google Website Crawl] Batch {b_idx+1} still running "
-                        f"({elapsed}s elapsed, status: {status})...")
+                    log(
+                        f"[Google Website Crawl] Batch {b_idx+1} still running "
+                        f"({elapsed}s elapsed, status: {status})..."
+                    )
                 time.sleep(POLL_INTERVAL)
 
-        # Always try to fetch whatever was crawled — even on failure/cancel
+        # Always fetch whatever was crawled — even on failure/cancel
         try:
             pages = _fetch_dataset(dataset_id)
         except Exception as e:
             log(f"[Google Website Crawl] Could not fetch dataset for batch {b_idx+1}: {e}")
             continue
 
-        # Extract and immediately save contacts per site
         batch_found = 0
         for page in pages:
             page_url  = page.get("url") or page.get("loadedUrl") or ""
             page_text = (
                 page.get("text") or
                 page.get("markdown") or
-                page.get("html") or ""
+                page.get("html") or
+                page.get("content") or
+                ""
             )
             if not page_url or not page_text:
                 continue
@@ -331,32 +401,49 @@ def _run_crawl_parallel(
             if not contacts["phones"] and not contacts["emails"]:
                 continue
 
-            base = _base_domain(page_url)
+            # Store under normalised key (no www.) so it matches saved
+            # lead URLs regardless of whether they include www.
+            base     = _base_domain(page_url)
+            norm_key = _normalise_domain(base)
+
             with contacts_lock:
-                if base not in contacts_map:
-                    contacts_map[base] = {"phones": [], "emails": []}
-                contacts_map[base]["phones"] = list(dict.fromkeys(
-                    contacts_map[base]["phones"] + contacts["phones"]
+                if norm_key not in contacts_map:
+                    contacts_map[norm_key] = {"phones": [], "emails": []}
+                contacts_map[norm_key]["phones"] = list(dict.fromkeys(
+                    contacts_map[norm_key]["phones"] + contacts["phones"]
                 ))[:5]
-                contacts_map[base]["emails"] = list(dict.fromkeys(
-                    contacts_map[base]["emails"] + contacts["emails"]
+                contacts_map[norm_key]["emails"] = list(dict.fromkeys(
+                    contacts_map[norm_key]["emails"] + contacts["emails"]
                 ))[:5]
             batch_found += 1
 
         phones_found = sum(len(v["phones"]) for v in contacts_map.values())
         emails_found = sum(len(v["emails"]) for v in contacts_map.values())
-        log(f"[Google Website Crawl] Batch {b_idx+1} complete — "
-            f"{batch_found} site(s) yielded contacts "
+        log(
+            f"[Google Website Crawl] Batch {b_idx+1} complete — "
+            f"{batch_found}/{len(batch)} site(s) yielded contacts "
             f"(running totals: {phones_found} phone(s), {emails_found} email(s) "
-            f"across {len(contacts_map)} site(s))")
+            f"across {len(contacts_map)} site(s))"
+        )
+
+        # Call enrich_callback after every batch so pipeline.py updates
+        # already-saved leads with freshly extracted contact data
+        if enrich_callback and contacts_map:
+            try:
+                with contacts_lock:
+                    snapshot = dict(contacts_map)
+                enrich_callback(snapshot)
+            except Exception as e:
+                log(f"[Google Website Crawl] Enrich callback error after batch {b_idx+1}: {e}")
 
     total_sites  = len(contacts_map)
     total_phones = sum(len(v["phones"]) for v in contacts_map.values())
     total_emails = sum(len(v["emails"]) for v in contacts_map.values())
-    log(f"[Google Website Crawl] All batches complete — "
+    log(
+        f"[Google Website Crawl] All batches complete — "
         f"{total_sites} site(s) with contact data, "
-        f"{total_phones} phone number(s), {total_emails} email address(es) extracted")
-
+        f"{total_phones} phone number(s), {total_emails} email address(es) extracted"
+    )
     crawl_done.set()
 
 
@@ -370,19 +457,17 @@ def scrape_google_search_progressive(
     deep_scrape_sites: bool = True,
     scrape_run_id=None,
     _log_fn=None,
+    enrich_callback=None,
 ):
     """
-    Generator — yields one bundle per query:
-        { "serp_pages": [...], "contacts_map": { domain: { phones, emails } } }
+    Generator — yields one bundle per query as soon as the SERP finishes:
 
-    For each query:
-      1. SERP actor is launched immediately.
-      2. As soon as SERP returns results, the website crawler is launched
-         in a background thread — in parallel, not after.
-      3. The generator waits for both to finish (or the crawl timeout),
-         then yields the combined bundle.
-      4. If cancelled at any point, whatever has been crawled so far is
-         still yielded so the pipeline can save partial contacts.
+        { "serp_pages": [...], "contacts_map": {} }
+
+    The website crawler runs in a background thread and populates
+    contacts_map incrementally.  enrich_callback(contacts_map) is called
+    after each crawl batch so pipeline.py can update already-saved leads
+    with contact data as it arrives.
     """
     log = _log_fn or print
 
@@ -392,17 +477,19 @@ def scrape_google_search_progressive(
             return
 
         log(f"[Google Search] ── Query {i+1}/{len(queries)} ──────────────────────────")
-        log(f"[Google Search] Searching: '{query} {location}' "
+        log(
+            f"[Google Search] Searching: '{query} {location}' "
             f"({max_pages} page(s) ≈ {max_pages * 10} results, "
-            f"AI Mode on, paid results on, leads enrichment {'on' if enrich_leads else 'off'})")
+            f"AI Mode on, paid results on, "
+            f"leads enrichment {'on' if enrich_leads else 'off'})"
+        )
 
-        # ── Step 1: Launch SERP actor ─────────────────────────
+        # ── Launch SERP actor ──────────────────────────────────
         payload = build_google_payload(
             query, location,
             max_pages=max_pages,
             enrich_leads=enrich_leads,
         )
-
         try:
             serp_result = _launch_actor(SERP_ACTOR_ID, payload, scrape_run_id)
         except Exception as e:
@@ -410,25 +497,23 @@ def scrape_google_search_progressive(
             continue
 
         if serp_result is None:
-            log(f"[Google Search] Cancelled while launching SERP actor for query {i+1} — stopping")
+            log("[Google Search] Cancelled while launching SERP actor — stopping")
             return
 
         serp_run_id, serp_dataset_id = serp_result
-        log(f"[Google Search] SERP actor launched (run {serp_run_id}) — "
-            f"waiting for Google to return results...")
+        log(f"[Google Search] SERP actor launched (run {serp_run_id}) — waiting for results...")
 
-        # ── Step 2: Poll SERP to completion ───────────────────
+        # ── Poll SERP to completion ────────────────────────────
         serp_pages = []
-        serp_poll_count = 0
-        serp_ok = False
+        serp_poll  = 0
+        serp_ok    = False
 
         while True:
             if _is_cancel_requested(scrape_run_id):
-                log(f"[Google Search] Cancel detected — aborting SERP run and saving partial results")
+                log("[Google Search] Cancel detected — aborting SERP run")
                 _abort_apify_run(serp_run_id)
                 try:
                     serp_pages = _fetch_dataset(serp_dataset_id)
-                    log(f"[Google Search] Partial SERP: {len(serp_pages)} page(s) saved before cancel")
                 except Exception:
                     pass
                 if serp_pages:
@@ -442,8 +527,7 @@ def scrape_google_search_progressive(
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            serp_poll_count += 1
-
+            serp_poll += 1
             if status == "SUCCEEDED":
                 serp_ok = True
                 break
@@ -451,13 +535,13 @@ def scrape_google_search_progressive(
                 log(f"[Google Search] SERP actor ended with: {status}")
                 break
             else:
-                if serp_poll_count % 3 == 0:
-                    elapsed = serp_poll_count * POLL_INTERVAL
-                    log(f"[Google Search] SERP running ({elapsed}s elapsed) — "
-                        f"Google is processing the search query...")
+                if serp_poll % 3 == 0:
+                    log(
+                        f"[Google Search] SERP running ({serp_poll * POLL_INTERVAL}s) — "
+                        f"Google is processing the query..."
+                    )
                 time.sleep(POLL_INTERVAL)
 
-        # Fetch SERP results (even on failure — grab partial data)
         try:
             serp_pages = _fetch_dataset(serp_dataset_id)
         except Exception as e:
@@ -466,35 +550,33 @@ def scrape_google_search_progressive(
 
         if not serp_ok:
             if serp_pages:
-                log(f"[Google Search] SERP ended early but recovered {len(serp_pages)} page(s) — "
-                    f"yielding partial results")
+                log(f"[Google Search] SERP ended early — recovered {len(serp_pages)} page(s)")
                 yield {"serp_pages": serp_pages, "contacts_map": {}}
             else:
                 log(f"[Google Search] SERP returned no results for query {i+1} — skipping")
             continue
 
-        # Count what the SERP returned
         total_organic = sum(len(p.get("organicResults") or []) for p in serp_pages)
         total_paid    = sum(len(p.get("paidResults")    or []) for p in serp_pages)
         total_leads   = sum(len(p.get("businessLeads")  or []) for p in serp_pages)
         has_ai        = any(p.get("aiModeResult") or p.get("aiOverview") for p in serp_pages)
 
-        log(f"[Google Search] SERP complete — {len(serp_pages)} page(s) returned: "
-            f"{total_organic} organic result(s), "
-            f"{total_paid} paid ad(s), "
-            f"{total_leads} enriched lead(s)"
-            + (", AI answer included" if has_ai else ""))
+        log(
+            f"[Google Search] SERP complete — {len(serp_pages)} page(s): "
+            f"{total_organic} organic, {total_paid} paid, {total_leads} enriched"
+            + (", AI answer included" if has_ai else "")
+        )
 
-        # ── Step 3: Launch website crawler IN PARALLEL ────────
+        # ── Launch website crawler IN BACKGROUND ──────────────
         contacts_map  = {}
         crawl_thread  = None
         crawl_done    = threading.Event()
         contacts_lock = threading.Lock()
 
         if deep_scrape_sites and not _is_cancel_requested(scrape_run_id):
-            # Collect unique contractor URLs from organic results
             urls_to_crawl = []
             seen_domains  = set()
+
             for page in serp_pages:
                 for result in (page.get("organicResults") or []):
                     url = result.get("url") or ""
@@ -504,14 +586,17 @@ def scrape_google_search_progressive(
                         domain = url.split("/")[2]
                     except IndexError:
                         continue
-                    if domain not in seen_domains:
-                        seen_domains.add(domain)
+                    # Normalise domain for dedup (strip www.)
+                    norm_domain = domain.replace("www.", "", 1)
+                    if norm_domain not in seen_domains:
+                        seen_domains.add(norm_domain)
                         urls_to_crawl.append(url)
 
             if urls_to_crawl:
-                log(f"[Google Search] Launching website crawler in parallel — "
-                    f"{len(urls_to_crawl)} contractor site(s) to crawl "
-                    f"(Playwright, JS rendering, /contact pages included)")
+                log(
+                    f"[Google Search] Launching website crawler in background — "
+                    f"{len(urls_to_crawl)} contractor site(s) to crawl"
+                )
                 crawl_thread = threading.Thread(
                     target=_run_crawl_parallel,
                     args=(
@@ -519,6 +604,7 @@ def scrape_google_search_progressive(
                         contacts_map,
                         contacts_lock,
                         crawl_done,
+                        enrich_callback,    # ← wired through correctly
                         scrape_run_id,
                         log,
                     ),
@@ -526,29 +612,41 @@ def scrape_google_search_progressive(
                 )
                 crawl_thread.start()
             else:
-                log(f"[Google Search] No contractor URLs to crawl for query {i+1} "
-                    f"(all results were directories or skipped domains)")
+                log(f"[Google Search] No contractor URLs to crawl for query {i+1}")
                 crawl_done.set()
         else:
             crawl_done.set()
 
-        # ── Step 4: Wait for crawl to finish ──────────────────
-        # Cap wait at 8 minutes — if sites are slow we don't block forever
-        CRAWL_TIMEOUT = 480
-        if crawl_thread and not crawl_done.wait(timeout=CRAWL_TIMEOUT):
-            log(f"[Google Search] Website crawl timeout ({CRAWL_TIMEOUT}s) — "
-                f"yielding whatever contacts were extracted so far "
-                f"({len(contacts_map)} site(s) with data)")
-
-        # ── Step 5: Yield combined bundle ─────────────────────
+        # ── Yield SERP results IMMEDIATELY ────────────────────
+        # contacts_map is likely empty here — that is intentional.
+        # pipeline.py saves the leads now; enrich_callback fills in
+        # contacts as each crawl batch finishes.
         with contacts_lock:
             snapshot = dict(contacts_map)
 
-        sites_with_phone = sum(1 for v in snapshot.values() if v["phones"])
-        sites_with_email = sum(1 for v in snapshot.values() if v["emails"])
-        log(f"[Google Search] Query {i+1} complete — yielding to pipeline: "
-            f"{len(serp_pages)} SERP page(s), "
-            f"{len(snapshot)} site(s) crawled "
-            f"({sites_with_phone} with phone, {sites_with_email} with email)")
-
+        log(
+            f"[Google Search] Query {i+1} — yielding {len(serp_pages)} SERP page(s) now"
+            + (
+                f" ({len(snapshot)} site(s) already crawled)"
+                if snapshot else " (crawler running in background)"
+            )
+        )
         yield {"serp_pages": serp_pages, "contacts_map": snapshot}
+
+        # ── Wait for crawler to finish (capped) ───────────────
+        if crawl_thread and not crawl_done.wait(timeout=CRAWL_TIMEOUT):
+            log(
+                f"[Google Search] Website crawl timeout ({CRAWL_TIMEOUT}s) — "
+                f"moving to next query; crawler thread continues enriching in background"
+            )
+
+        # Final enrich pass once crawler fully finishes — catches any
+        # batches that completed after the initial yield
+        with contacts_lock:
+            final_snapshot = dict(contacts_map)
+
+        if final_snapshot and enrich_callback:
+            try:
+                enrich_callback(final_snapshot)
+            except Exception as e:
+                log(f"[Google Search] Final enrich callback error: {e}")
