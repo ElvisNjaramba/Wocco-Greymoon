@@ -274,9 +274,6 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
   const activeFamily = sourceFamily(activeSrc);
   const activeCfg    = SOURCE_CFG[activeFamily?.toUpperCase()];
 
-  // Always show the highest count we know about — local state (from polling
-  // new rows) vs server-side counter (from checkScrapeStatus). They update
-  // on slightly different cycles so taking the max avoids flicker/regression.
   const displayCount = Math.max(liveLeadCount ?? 0, serverSaved);
   useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [log.length]);
   const [elapsed, setElapsed] = useState(0);
@@ -533,6 +530,13 @@ const ALL_SOURCES = [
   { key: "google",     label: "Google",          emoji: "🔍" },
 ];
 
+// ── Helper: format city display name with state ───────────────
+function cityDisplayName(city) {
+  if (!city) return "";
+  if (city.state) return `${city.name}, ${city.state}`;
+  return city.name;
+}
+
 // ── Facebook Groups Management Panel ─────────────────────────
 function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
   const [groups, setGroups]               = useState([]);
@@ -560,7 +564,6 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
 
   useEffect(() => { fetchGroups(); }, [fetchGroups]);
 
-  // Refresh after a scrape finishes
   useEffect(() => {
     if (scrapeStatus?.status && scrapeStatus.status !== "RUNNING") fetchGroups();
   }, [scrapeStatus?.status]);
@@ -685,7 +688,6 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
           </div>
         </div>
 
-        {/* Posts per group + scrape button (shown when groups selected) */}
         {selectedUrls.size > 0 && (
           <div className="px-4 py-3 bg-indigo-500/5 border-b border-indigo-500/15 flex flex-col sm:flex-row items-start sm:items-center gap-3">
             <div className="flex-1 space-y-1">
@@ -732,7 +734,6 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
                     selectedGroup?.group_url === g.group_url ? "bg-indigo-500/5 border-l-2 border-indigo-500" : "border-l-2 border-transparent"
                   }`}
                 >
-                  {/* Checkbox */}
                   <button
                     onClick={() => toggleSelect(g.group_url)}
                     className={`w-4 h-4 rounded border-2 flex-shrink-0 flex items-center justify-center transition-all ${
@@ -742,7 +743,6 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
                     {isSelected && <svg className="w-2.5 h-2.5 text-white" fill="currentColor" viewBox="0 0 12 12"><path d="M10 3L5 8.5 2 5.5l-1 1L5 10.5l6-7-1-0.5z"/></svg>}
                   </button>
 
-                  {/* Avatar + name */}
                   <div
                     className="flex-1 min-w-0 flex items-center gap-3 cursor-pointer"
                     onClick={() => {
@@ -769,7 +769,6 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
                     </div>
                   </div>
 
-                  {/* Actions */}
                   <div className="flex items-center gap-1 flex-shrink-0">
                     <a href={g.group_url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="text-white/20 hover:text-indigo-400 transition-colors p-1.5 rounded-lg hover:bg-indigo-500/10">
                       <ExternalLink className="w-3.5 h-3.5" />
@@ -788,56 +787,134 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
       {/* Group drill-down */}
       {selectedGroup && (
         <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
-          <div className="px-4 py-3.5 border-b border-white/[0.06] flex items-center justify-between">
-            <div className="min-w-0">
-              <div className="text-sm font-semibold truncate">{selectedGroup.group_name || selectedGroup.group_url}</div>
-              <div className="text-[11px] text-white/30 mt-0.5">{groupLeadsTotal} posts stored</div>
+          <div className="px-4 py-3.5 border-b border-white/[0.06] flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500/30 to-purple-600/30 border border-indigo-500/20 flex items-center justify-center text-indigo-300 text-xs font-bold flex-shrink-0">
+                {(selectedGroup.group_name || "?").charAt(0).toUpperCase()}
+              </div>
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-white/90 truncate">{selectedGroup.group_name || selectedGroup.group_url}</div>
+                <div className="text-[11px] text-white/35 mt-0.5">
+                  {groupLeadsLoading ? "Loading…" : `${groupLeadsTotal} post${groupLeadsTotal !== 1 ? "s" : ""} stored`}
+                  {groupLeadsTotalPages > 1 && !groupLeadsLoading && ` · page ${groupLeadsPage} of ${groupLeadsTotalPages}`}
+                </div>
+              </div>
             </div>
-            <button onClick={() => { setSelectedGroup(null); setGroupLeads([]); }} className="text-white/30 hover:text-white/60 ml-3 flex-shrink-0">
-              <X className="w-4 h-4" />
-            </button>
+            <div className="flex items-center gap-2 flex-shrink-0">
+              <a href={selectedGroup.group_url} target="_blank" rel="noopener noreferrer" className="text-white/20 hover:text-indigo-400 transition-colors p-1.5 rounded-lg hover:bg-indigo-500/10">
+                <ExternalLink className="w-3.5 h-3.5" />
+              </a>
+              <button onClick={() => { setSelectedGroup(null); setGroupLeads([]); setGroupLeadsPage(1); }} className="text-white/30 hover:text-white/60 p-1.5 rounded-lg hover:bg-white/5 transition-colors">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
           </div>
+
           {groupLeadsLoading ? (
-            <div className="py-10 flex items-center justify-center"><Loader className="w-5 h-5 text-indigo-400 animate-spin" /></div>
+            <div className="py-12 flex flex-col items-center justify-center gap-3">
+              <Loader className="w-6 h-6 text-indigo-400 animate-spin" />
+              <span className="text-[11px] text-white/30">Loading posts…</span>
+            </div>
           ) : groupLeads.length === 0 ? (
-            <div className="py-8 text-center text-white/30 text-sm">No posts stored for this group yet.</div>
+            <div className="py-12 flex flex-col items-center gap-3 text-white/25">
+              <MessageSquare className="w-8 h-8 text-white/10" />
+              <span className="text-sm">No posts scraped from this group yet</span>
+              <p className="text-[11px] text-white/15 text-center max-w-xs">Select this group and click Scrape to pull posts from it</p>
+            </div>
           ) : (
-            <div>
+            <>
               <div className="divide-y divide-white/[0.04]">
-                {groupLeads.map(lead => (
-                  <div key={lead.post_id} className="px-4 py-3 hover:bg-white/[0.02] transition-colors cursor-pointer" onClick={() => setSelectedLead(lead)}>
-                    <div className="flex items-start gap-3">
-                      <div className="w-7 h-7 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0 mt-0.5">
-                        {(lead.raw_json?.authorName || lead.title || "?").charAt(0).toUpperCase()}
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 flex-wrap"><ScoreDot score={lead.score} /><StatusSelect value={lead.status} onChange={v => updateLeadStatus(lead.post_id, v)} /></div>
-                        <p className="text-xs text-white/50 mt-1 line-clamp-2 leading-relaxed">{lead.post?.slice(0, 180)}</p>
-                        <div className="flex items-center gap-3 mt-1.5 flex-wrap">
-                          {lead.phone    && <span className="text-[11px] text-emerald-400/80 flex items-center gap-1"><Phone className="w-2.5 h-2.5" />{lead.phone}</span>}
-                          {lead.email    && <span className="text-[11px] text-blue-400/80 flex items-center gap-1"><Mail className="w-2.5 h-2.5" />{lead.email}</span>}
-                          {lead.location && <span className="text-[11px] text-white/25 flex items-center gap-1"><MapPin className="w-2.5 h-2.5" />{lead.location}</span>}
+                {groupLeads.map(lead => {
+                  const authorName = lead.raw_json?.authorName || lead.raw_json?.author || "";
+                  const authorInitial = (authorName || lead.title || "?").charAt(0).toUpperCase();
+                  const snippet = (lead.post || "").slice(0, 220) + ((lead.post || "").length > 220 ? "…" : "");
+                  const postDate = lead.datetime ? new Date(lead.datetime).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : null;
+                  const likes    = lead.raw_json?.likesCount    || 0;
+                  const comments = lead.raw_json?.commentsCount || 0;
+                  return (
+                    <div
+                      key={lead.post_id}
+                      className="px-4 py-3.5 hover:bg-white/[0.02] transition-colors cursor-pointer group"
+                      onClick={() => setSelectedLead(lead)}
+                    >
+                      <div className="flex items-start gap-3 mb-2">
+                        <div className="w-7 h-7 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0 mt-0.5">
+                          {authorInitial}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            {authorName && <span className="text-xs font-semibold text-white/75 truncate max-w-[160px]">{authorName}</span>}
+                            {postDate && <span className="text-[10px] text-white/25 font-mono">{postDate}</span>}
+                            <div className="ml-auto flex items-center gap-2 flex-shrink-0">
+                              <ScoreDot score={lead.score} />
+                            </div>
+                          </div>
+                        </div>
+                        <div onClick={e => e.stopPropagation()} className="flex-shrink-0">
+                          <StatusSelect value={lead.status} onChange={v => updateLeadStatus(lead.post_id, v)} />
                         </div>
                       </div>
+
+                      {snippet && (
+                        <p className="text-xs text-white/50 leading-relaxed mb-2.5 whitespace-pre-wrap ml-10">{snippet}</p>
+                      )}
+
+                      <div className="flex items-center gap-3 ml-10 flex-wrap">
+                        {lead.phone && (
+                          <a href={`tel:${lead.phone}`} onClick={e => e.stopPropagation()} className="inline-flex items-center gap-1 text-[11px] text-emerald-400 font-semibold hover:text-emerald-300 transition-colors">
+                            <Phone className="w-3 h-3" />{lead.phone}
+                          </a>
+                        )}
+                        {lead.email && (
+                          <a href={`mailto:${lead.email}`} onClick={e => e.stopPropagation()} className="inline-flex items-center gap-1 text-[11px] text-violet-400 font-semibold hover:text-violet-300 transition-colors">
+                            <Mail className="w-3 h-3" />{lead.email}
+                          </a>
+                        )}
+                        {lead.location && (
+                          <span className="text-[10px] text-white/25 flex items-center gap-1">
+                            <MapPin className="w-2.5 h-2.5" />{lead.location}
+                          </span>
+                        )}
+                        {likes > 0 && <span className="text-[10px] text-white/20 flex items-center gap-1"><ThumbsUp className="w-2.5 h-2.5" />{likes}</span>}
+                        {comments > 0 && <span className="text-[10px] text-white/20 flex items-center gap-1"><MessageSquare className="w-2.5 h-2.5" />{comments}</span>}
+                        <span className="ml-auto text-[10px] text-indigo-400/40 opacity-0 group-hover:opacity-100 transition-opacity">View full post →</span>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
+
               {groupLeadsTotalPages > 1 && (
-                <div className="px-4 py-3 border-t border-white/[0.06] flex items-center justify-between">
-                  <span className="text-[11px] text-white/30">Page {groupLeadsPage} of {groupLeadsTotalPages}</span>
-                  <div className="flex gap-2">
-                    <button disabled={groupLeadsPage <= 1} onClick={() => { const p = groupLeadsPage - 1; fetchGroupLeads(selectedGroup.group_url, p); }} className="px-3 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">‹</button>
-                    <button disabled={groupLeadsPage >= groupLeadsTotalPages} onClick={() => { const p = groupLeadsPage + 1; fetchGroupLeads(selectedGroup.group_url, p); }} className="px-3 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">›</button>
+                <div className="px-4 py-3 border-t border-white/[0.06] flex flex-col sm:flex-row items-center justify-between gap-2">
+                  <span className="text-[11px] text-white/25 order-2 sm:order-1">
+                    {((groupLeadsPage - 1) * 50) + 1}–{Math.min(groupLeadsPage * 50, groupLeadsTotal)} of {groupLeadsTotal} posts
+                  </span>
+                  <div className="flex items-center gap-1 order-1 sm:order-2">
+                    <button onClick={() => fetchGroupLeads(selectedGroup.group_url, 1)} disabled={groupLeadsPage === 1} className="px-2.5 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">«</button>
+                    <button onClick={() => fetchGroupLeads(selectedGroup.group_url, groupLeadsPage - 1)} disabled={groupLeadsPage <= 1} className="px-2.5 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">‹</button>
+                    {Array.from({ length: groupLeadsTotalPages }, (_, i) => i + 1)
+                      .filter(p => p === 1 || p === groupLeadsTotalPages || Math.abs(p - groupLeadsPage) <= 2)
+                      .reduce((acc, p, idx, arr) => {
+                        if (idx > 0 && p - arr[idx - 1] > 1) acc.push("...");
+                        acc.push(p);
+                        return acc;
+                      }, [])
+                      .map((p, i) => p === "..." ? (
+                        <span key={`ellipsis-${i}`} className="px-1.5 text-white/20 text-xs">…</span>
+                      ) : (
+                        <button key={p} onClick={() => fetchGroupLeads(selectedGroup.group_url, p)} className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${groupLeadsPage === p ? "bg-indigo-600 text-white" : "bg-white/5 text-white/40 hover:text-white"}`}>{p}</button>
+                      ))
+                    }
+                    <button onClick={() => fetchGroupLeads(selectedGroup.group_url, groupLeadsPage + 1)} disabled={groupLeadsPage >= groupLeadsTotalPages} className="px-2.5 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">›</button>
+                    <button onClick={() => fetchGroupLeads(selectedGroup.group_url, groupLeadsTotalPages)} disabled={groupLeadsPage === groupLeadsTotalPages} className="px-2.5 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">»</button>
                   </div>
                 </div>
               )}
-            </div>
+            </>
           )}
         </div>
       )}
 
-      {/* Lead detail modal for group drill-down */}
       {selectedLead && (
         <LeadDetailModal lead={selectedLead} onClose={() => setSelectedLead(null)} updateStatus={updateLeadStatus} />
       )}
@@ -845,7 +922,7 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
   );
 }
 
-// ── Lead Detail Modal (extracted for reuse) ───────────────────
+// ── Lead Detail Modal ─────────────────────────────────────────
 function LeadDetailModal({ lead, onClose, updateStatus }) {
   return (
     <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-[2000] flex items-end sm:items-center justify-center p-0 sm:p-4" onClick={onClose}>
@@ -974,7 +1051,6 @@ export default function Services() {
   const [fbGeoCoords, setFbGeoCoords]         = useState({});
   const geocodingQueue = useRef(new Set());
   const [zipHint, setZipHint] = useState(null);
-  // track FB groups count for tab badge
   const [fbGroupCount, setFbGroupCount] = useState(0);
 
   useEffect(() => { const t = setTimeout(() => setFSearchDebounced(fSearch), 400); return () => clearTimeout(t); }, [fSearch]);
@@ -1015,11 +1091,17 @@ export default function Services() {
   }, [headers, fSource, fServiceCat, fStatus, fMinScore, fSearchDebounced, fHasPhone, fHasEmail, fFbGroupDebounced]);
 
   const fetchNewLeadsOnly = useCallback(async () => {
-    if (!newestLeadTs.current) { await fetchLeads(1); return; }
     try {
-      const params = { page: 1, page_size: 50, date_after: newestLeadTs.current, ordering: "-created_at" };
-      if (fSource)     params.source           = fSource;
-      if (fServiceCat) params.service_category = fServiceCat;
+      const floor = newestLeadTs.current
+        || (scrapeStatus?.started_at ? new Date(new Date(scrapeStatus.started_at).getTime() - 5000).toISOString() : null)
+        || new Date(Date.now() - 30_000).toISOString();
+
+      const params = {
+        page: 1,
+        page_size: 100,
+        date_after: floor,
+        ordering: "-created_at",
+      };
       const res     = await axios.get(`${API}/leads/`, { headers, params });
       const data    = res.data;
       const results = Array.isArray(data) ? data : (data.results ?? []);
@@ -1031,13 +1113,13 @@ export default function Services() {
           const truly_new   = results.filter(l => !existingIds.has(l.post_id));
           if (truly_new.length === 0) return prev;
           setTotalLeads(t => t + truly_new.length);
-          setNewLeadsBuffer(buf => [...truly_new, ...buf].slice(0, 20));
+          setNewLeadsBuffer(buf => [...truly_new, ...buf].slice(0, 30));
           setPendingNewCount(c => c + truly_new.length);
           return [...truly_new, ...prev];
         });
       }
     } catch (e) { console.error(e); }
-  }, [headers, fSource, fServiceCat, fetchLeads]);
+  }, [headers, scrapeStatus?.started_at]);
 
   const geocodeFbLeads = useCallback(async (leadsToGeocode) => {
     const need = leadsToGeocode.filter(l => l.source === "FACEBOOK" && !l.latitude && !l.longitude && l.location && !geocodingQueue.current.has(l.post_id) && fbGeoCoords[l.post_id] === undefined);
@@ -1075,17 +1157,17 @@ export default function Services() {
 
   useEffect(() => {
     if (!scraping) return;
-    // Tight loop: check status (carries server-side leads_collected) every 2s,
-    // fetch new leads every 3s, history every 10s
+    checkScrapeStatus();
+    fetchNewLeadsOnly();
     let tick = 0;
     const iv = setInterval(() => {
       tick++;
-      checkScrapeStatus();           // always — carries leads_collected from DB
-      fetchNewLeadsOnly();           // always — streams new lead rows into state
-      if (tick % 4 === 0) fetchHistory();
+      checkScrapeStatus();
+      fetchNewLeadsOnly();
+      if (tick % 8 === 0) fetchHistory();
     }, 2000);
     return () => clearInterval(iv);
-  }, [scraping, checkScrapeStatus, fetchHistory, fetchNewLeadsOnly]);
+  }, [scraping, checkScrapeStatus, fetchNewLeadsOnly, fetchHistory]);
 
   useEffect(() => {
     if (scrapeStatus?.status && scrapeStatus.status !== "RUNNING") fetchFbGroupCount();
@@ -1093,16 +1175,33 @@ export default function Services() {
 
   useEffect(() => { if (activeTab === "map" && leads.length > 0) geocodeFbLeads(leads); }, [activeTab, leads, geocodeFbLeads]);
 
+  // ── UPDATED: City suggestions now show "City, State" format ──
   useEffect(() => {
     if (!locationValue.trim()) { setSuggestions({ list: [], show: false }); return; }
     const q = locationValue.toLowerCase();
     if (locationType === "city") {
-      const matches = cities.filter(c => c.name.toLowerCase().includes(q) || c.display.toLowerCase().includes(q)).slice(0, 12).map(c => ({ code: c.code, name: c.name, sub: c.state || "" }));
+      const matches = cities
+        .filter(c =>
+          c.name.toLowerCase().includes(q) ||
+          (c.display && c.display.toLowerCase().includes(q)) ||
+          (c.state && c.state.toLowerCase().includes(q))
+        )
+        .slice(0, 12)
+        .map(c => ({
+          code: c.code,
+          name: cityDisplayName(c),   // "Birmingham, Alabama"
+          rawName: c.name,             // "Birmingham" — sent to scraper
+        }));
       setSuggestions({ list: matches, show: matches.length > 0 });
     } else if (locationType === "state") {
-      const matches = US_STATES.filter(st => st.toLowerCase().startsWith(q) || st.toLowerCase().includes(q)).slice(0, 12).map(st => ({ code: st, name: st, sub: "" }));
+      const matches = US_STATES
+        .filter(st => st.toLowerCase().startsWith(q) || st.toLowerCase().includes(q))
+        .slice(0, 12)
+        .map(st => ({ code: st, name: st, rawName: st }));
       setSuggestions({ list: matches, show: matches.length > 0 });
-    } else { setSuggestions({ list: [], show: false }); }
+    } else {
+      setSuggestions({ list: [], show: false });
+    }
   }, [locationValue, locationType, cities]);
 
   const startScrape = async () => {
@@ -1114,20 +1213,24 @@ export default function Services() {
       return alert("Enter a location, or provide Facebook group URLs for a Facebook-only run.");
     }
     if (selectedSources.length === 0) return alert("Select at least one source.");
-    // Categories only required for non-Facebook sources
     if (nonFbSources.length > 0 && selectedCategories.length === 0) {
       return alert("Select at least one category for Craigslist / Google.");
     }
 
     setScraping(true); setScrapeStatus(null); setSidebarOpen(false);
-    newestLeadTs.current = null; setNewLeadsBuffer([]); setPendingNewCount(0);
+    newestLeadTs.current = new Date().toISOString();
+    setNewLeadsBuffer([]); setPendingNewCount(0);
     try {
       const fbGroupUrlsClean = fbManualGroupUrls.trim()
         ? fbManualGroupUrls.split(/[\n,]+/).map(u => u.trim()).filter(u => u.startsWith("http"))
         : [];
+
+      // Strip the ", State" suffix before sending to the scraper —
+      // the backend only needs the raw city name or code.
+      const rawLocation = locationValue.trim().split(",")[0].trim();
+
       const res = await axios.post(`${API}/scrape/start/`, {
-        location: { type: locationType, value: locationValue.trim() },
-        // Only send categories when non-FB sources are selected
+        location: { type: locationType, value: rawLocation },
         ...(selectedCategories.length > 0 ? { categories: selectedCategories } : {}),
         max_posts_per_group: maxPostsPerGroup,
         sources: selectedSources,
@@ -1135,7 +1238,10 @@ export default function Services() {
         google_max_pages:   googleMaxPages,
         google_deep_scrape: googleDeepScrape,
       }, { headers });
-      setRunId(res.data.run_id); fetchHistory(); setTimeout(checkScrapeStatus, 800);
+      setRunId(res.data.run_id);
+      fetchHistory();
+      setTimeout(checkScrapeStatus, 1000);
+      setTimeout(fetchNewLeadsOnly, 2000);
     } catch (e) { alert(e.response?.data?.error || "Failed to start scrape."); setScraping(false); }
   };
 
@@ -1221,28 +1327,72 @@ export default function Services() {
 
           {/* Location input */}
           <div className="relative">
-            <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-2">{locationType === "city" ? "City" : locationType === "state" ? "State" : "ZIP Code"}</label>
+            <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-2">
+              {locationType === "city" ? "City" : locationType === "state" ? "State" : "ZIP Code"}
+            </label>
             <div className="relative">
               <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-white/30 pointer-events-none" />
-              <input ref={locationInputRef} type="text" value={locationValue} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck="false"
-                onFocus={() => { if (locationType !== "zip" && !locationValue.trim()) { if (locationType === "city") setSuggestions({ list: cities.slice(0, 50).map(c => ({ code: c.code, name: c.name, state: c.state })), show: true }); else setSuggestions({ list: US_STATES.map(st => ({ code: st, name: st, state: "" })), show: true }); } }}
+              <input
+                ref={locationInputRef}
+                type="text"
+                value={locationValue}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck="false"
+                onFocus={() => {
+                  if (locationType !== "zip" && !locationValue.trim()) {
+                    if (locationType === "city") {
+                      // ── UPDATED: show all cities with "City, State" on focus ──
+                      setSuggestions({
+                        list: cities.slice(0, 50).map(c => ({
+                          code: c.code,
+                          name: cityDisplayName(c),
+                          rawName: c.name,
+                        })),
+                        show: true,
+                      });
+                    } else {
+                      setSuggestions({
+                        list: US_STATES.map(st => ({ code: st, name: st, rawName: st })),
+                        show: true,
+                      });
+                    }
+                  }
+                }}
                 onChange={e => { lastTypedRef.current = Date.now(); setLocationValue(e.target.value); }}
                 onBlur={() => setTimeout(() => setSuggestions(s => ({ ...s, show: false })), 180)}
-                placeholder={locationType === "city" ? "Search or select a city..." : locationType === "state" ? "Search or select a state..." : "e.g. 77001"}
-                className="w-full bg-white/5 border border-white/10 rounded-xl pl-9 pr-4 py-2.5 text-sm text-white placeholder-white/20 focus:outline-none focus:border-blue-500/60 transition-all" />
+                placeholder={
+                  locationType === "city"  ? "Search cities..." :
+                  locationType === "state" ? "Search or select a state..." :
+                  "e.g. 77001"
+                }
+                className="w-full bg-white/5 border border-white/10 rounded-xl pl-9 pr-4 py-2.5 text-sm text-white placeholder-white/20 focus:outline-none focus:border-blue-500/60 transition-all"
+              />
             </div>
+
+            {/* ── UPDATED: suggestions dropdown — state baked into name, no separate sub ── */}
             {suggestions.show && suggestions.list.length > 0 && (
               <div className="absolute z-50 left-0 right-0 mt-1 bg-[#16192a] border border-white/10 rounded-xl shadow-2xl overflow-hidden">
                 <div className="max-h-52 overflow-y-auto">
                   {suggestions.list.map(c => (
-                    <button key={c.code} onMouseDown={e => e.preventDefault()} onClick={() => { setLocationValue(c.name); setSuggestions({ list: [], show: false }); setTimeout(() => locationInputRef.current?.focus(), 0); }}
-                      className="w-full text-left px-4 py-2.5 text-sm text-white/70 hover:bg-white/[0.07] hover:text-white flex justify-between items-center transition-colors">
-                      <span>{c.name}</span>{c.state && <span className="text-white/25 text-xs ml-2 flex-shrink-0">{c.state}</span>}
+                    <button
+                      key={c.code}
+                      onMouseDown={e => e.preventDefault()}
+                      onClick={() => {
+                        setLocationValue(c.name);       // shows "Birmingham, Alabama"
+                        setSuggestions({ list: [], show: false });
+                        setTimeout(() => locationInputRef.current?.focus(), 0);
+                      }}
+                      className="w-full text-left px-4 py-2.5 text-sm text-white/70 hover:bg-white/[0.07] hover:text-white transition-colors"
+                    >
+                      {c.name}
                     </button>
                   ))}
                 </div>
               </div>
             )}
+
             {zipHint && (
               <div className="mt-2 flex items-start gap-2 bg-indigo-500/5 border border-indigo-500/15 rounded-xl px-3 py-2">
                 <Info className="w-3 h-3 text-indigo-400/60 flex-shrink-0 mt-0.5" />
@@ -1311,22 +1461,19 @@ export default function Services() {
             </div>
           </div>
 
-          {/* Facebook settings — manual groups only, no search */}
+          {/* Facebook settings */}
           {showFbSettings && (
             <div className="space-y-3 pt-1 border-t border-white/[0.06]">
               <div className="flex items-center gap-2 pt-1">
                 <Users className="w-3.5 h-3.5 text-indigo-400" />
                 <span className="text-[11px] font-semibold uppercase tracking-widest text-indigo-400/80">Facebook Settings</span>
               </div>
-
               <div className="bg-indigo-500/5 border border-indigo-500/15 rounded-xl px-3 py-2.5">
                 <p className="text-[10px] text-indigo-300/60 leading-relaxed">
                   Paste group URLs to scrape. Already-scraped posts are always skipped automatically.
                   Use the <span className="font-semibold text-indigo-300/80">Groups tab</span> to manage your full group library.
                 </p>
               </div>
-
-              {/* Posts per group */}
               <div>
                 <div className="flex items-center justify-between mb-1.5">
                   <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30">Posts per Group</label>
@@ -1338,8 +1485,6 @@ export default function Services() {
                   className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/60 transition-all tabular-nums"
                 />
               </div>
-
-              {/* Manual group URLs */}
               <div>
                 <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-1">Group URLs</label>
                 <textarea value={fbManualGroupUrls} autoComplete="off" spellCheck="false"
@@ -1359,21 +1504,37 @@ export default function Services() {
                 <Search className="w-3.5 h-3.5 text-sky-400" />
                 <span className="text-[11px] font-semibold uppercase tracking-widest text-sky-400/80">Google Settings</span>
               </div>
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
                   <div>
-                    <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30">Results Depth</label>
-                    <div className="text-[10px] text-white/20 mt-0.5">~{googleMaxPages * 10} results per category</div>
+                    <label className="text-xs font-semibold text-white/70">How far to search</label>
+                    <p className="text-[10px] text-white/30 mt-0.5 leading-relaxed">More pages = more businesses found, but takes longer.</p>
                   </div>
-                  <div className="text-right">
+                  <div className="text-right flex-shrink-0 ml-3">
                     <span className="text-sm font-bold text-sky-300 tabular-nums">{googleMaxPages}</span>
-                    <div className="text-[10px] text-white/25">pages</div>
+                    <div className="text-[10px] text-white/25">{googleMaxPages === 1 ? "page" : "pages"}</div>
                   </div>
                 </div>
                 <input type="range" min={1} max={10} step={1} value={googleMaxPages} onChange={e => setGoogleMaxPages(Number(e.target.value))} className="w-full accent-sky-500 cursor-pointer" />
+                <div className="grid grid-cols-3 gap-1 text-[10px]">
+                  <button onClick={() => setGoogleMaxPages(1)} className={`py-1.5 px-2 rounded-lg border text-left transition-all ${googleMaxPages <= 2 ? "border-sky-500/40 bg-sky-500/10 text-sky-300" : "border-white/[0.06] text-white/25 hover:text-white/50"}`}>
+                    <div className="font-semibold">Quick</div><div className="text-[9px] opacity-70">~10 results</div>
+                  </button>
+                  <button onClick={() => setGoogleMaxPages(5)} className={`py-1.5 px-2 rounded-lg border text-left transition-all ${googleMaxPages >= 3 && googleMaxPages <= 7 ? "border-sky-500/40 bg-sky-500/10 text-sky-300" : "border-white/[0.06] text-white/25 hover:text-white/50"}`}>
+                    <div className="font-semibold">Normal</div><div className="text-[9px] opacity-70">~50 results</div>
+                  </button>
+                  <button onClick={() => setGoogleMaxPages(10)} className={`py-1.5 px-2 rounded-lg border text-left transition-all ${googleMaxPages >= 8 ? "border-sky-500/40 bg-sky-500/10 text-sky-300" : "border-white/[0.06] text-white/25 hover:text-white/50"}`}>
+                    <div className="font-semibold">Deep</div><div className="text-[9px] opacity-70">~100 results</div>
+                  </button>
+                </div>
               </div>
-              <div className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-3">
-                <Toggle value={googleDeepScrape} onChange={setGoogleDeepScrape} label="Deep-scrape contractor sites" hint="Visits each result to extract phone, email, and address" />
+              <div className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-3 space-y-2">
+                <Toggle value={googleDeepScrape} onChange={setGoogleDeepScrape} label="Visit each website for contact info" hint={null} />
+                <p className="text-[10px] text-white/25 leading-relaxed">
+                  {googleDeepScrape
+                    ? "✓ We'll open each business's website and look for their phone number and email — like a person would. Slower but finds way more contacts."
+                    : "We'll only use what's visible in Google search results. Faster, but fewer phone numbers and emails."}
+                </p>
               </div>
             </div>
           )}
@@ -1385,9 +1546,7 @@ export default function Services() {
                 if (selectedSources.length === 0) return true;
                 const fbOnly = selectedSources.length === 1 && selectedSources[0] === "facebook";
                 const hasFbGroups = fbManualGroupUrls.trim();
-                // FB-only with group URLs — no location or category needed
                 if (fbOnly && hasFbGroups) return false;
-                // Anything else needs a location
                 if (!locationValue.trim()) return true;
                 return false;
               })()}
@@ -1522,30 +1681,92 @@ export default function Services() {
         <main className="space-y-4 min-w-0">
           {scraping && scrapeStatus && <ScrapeLiveDashboard scrapeStatus={scrapeStatus} onStop={cancelScrape} isAborting={isAborting} liveLeadCount={totalLeads} newLeadsBuffer={newLeadsBuffer} />}
 
-          {/* Live mini feed during scrape */}
-          {scraping && leads.length > 0 && (
+          {scraping && (
             <div className="bg-white/[0.02] border border-white/[0.06] rounded-2xl overflow-hidden">
               <div className="px-4 py-3 border-b border-white/[0.06] flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                <span className="text-xs font-semibold text-white/60">Leads — updating live</span>
-                <span className="text-[11px] text-white/25 ml-auto">{Math.max(totalLeads, scrapeStatus?.leads_collected ?? 0)} total</span>
+                <span className="text-xs font-semibold text-white/60">
+                  {leads.length === 0 ? "Waiting for first leads…" : "Leads — updating live"}
+                </span>
+                <span className="text-[11px] text-white/25 ml-auto">
+                  {Math.max(totalLeads, scrapeStatus?.leads_collected ?? 0) > 0
+                    ? `${Math.max(totalLeads, scrapeStatus?.leads_collected ?? 0)} saved`
+                    : scrapeStatus?.current_stage || "Starting…"}
+                </span>
               </div>
-              <div className="divide-y divide-white/[0.04] max-h-[400px] overflow-y-auto">
-                {leads.slice(0, 20).map(lead => (
-                  <div key={lead.post_id} className="px-4 py-3 flex items-start gap-3 hover:bg-white/[0.02] cursor-pointer transition-colors" onClick={() => setSelectedLead(lead)}>
-                    <SourceTag source={lead.source} />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs font-medium text-white/75 truncate">{lead.title}</p>
-                      <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                        {lead.location && <span className="text-[10px] text-white/30 flex items-center gap-0.5"><MapPin className="w-2.5 h-2.5" />{lead.location}</span>}
-                        {lead.phone    && <span className="text-[10px] text-emerald-400/70 flex items-center gap-0.5"><Phone className="w-2.5 h-2.5" />{lead.phone}</span>}
+
+              {leads.length === 0 ? (
+                <div className="px-4 py-6 flex flex-col items-center gap-4 text-center">
+                  <div className="relative">
+                    <div className="w-12 h-12 rounded-full bg-blue-500/10 border border-blue-500/20 flex items-center justify-center">
+                      <Loader className="w-5 h-5 text-blue-400 animate-spin" />
+                    </div>
+                    <div className="absolute inset-0 rounded-full bg-blue-500/5 animate-ping" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-semibold text-white/70 mb-1">
+                      {scrapeStatus?.current_stage || "Initialising pipeline…"}
+                    </p>
+                    {scrapeStatus?.stage_detail && (
+                      <p className="text-[11px] text-white/35 leading-relaxed max-w-sm">{scrapeStatus.stage_detail}</p>
+                    )}
+                    {!scrapeStatus?.current_stage && (
+                      <p className="text-[11px] text-white/30 leading-relaxed max-w-xs">
+                        The scraper is launching. First leads usually appear within 1–3 minutes depending on the source.
+                      </p>
+                    )}
+                  </div>
+                  {(scrapeStatus?.activity_log?.length ?? 0) > 0 && (
+                    <div className="w-full max-w-md space-y-1">
+                      {[...(scrapeStatus.activity_log)].reverse().slice(0, 3).map((entry, i) => {
+                        const cfg = LOG_CFG[entry.level] || LOG_CFG.info;
+                        const Icon = cfg.icon;
+                        return (
+                          <div key={i} className={`flex items-start gap-2 px-3 py-2 rounded-xl text-left ${i === 0 ? cfg.bg + " border border-white/[0.04]" : "opacity-40"}`}>
+                            <Icon className={`w-3 h-3 mt-0.5 flex-shrink-0 ${cfg.text}`} />
+                            <div className="flex-1 min-w-0">
+                              <span className={`text-[10px] font-semibold ${i === 0 ? cfg.text : "text-white/30"}`}>{entry.stage}</span>
+                              {entry.detail && <p className="text-[10px] text-white/30 leading-relaxed mt-px truncate">{entry.detail}</p>}
+                            </div>
+                            <span className="text-[9px] text-white/15 font-mono flex-shrink-0">
+                              {entry.ts ? new Date(entry.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : ""}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="divide-y divide-white/[0.04] max-h-[420px] overflow-y-auto">
+                  {leads.slice(0, 25).map((lead, i) => (
+                    <div
+                      key={lead.post_id}
+                      className={`px-4 py-3 flex items-start gap-3 hover:bg-white/[0.02] cursor-pointer transition-all ${i === 0 ? "bg-emerald-500/[0.03]" : ""}`}
+                      onClick={() => setSelectedLead(lead)}
+                    >
+                      <SourceTag source={lead.source} />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-medium text-white/75 truncate">{lead.title}</p>
+                        <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                          {lead.location && <span className="text-[10px] text-white/30 flex items-center gap-0.5"><MapPin className="w-2.5 h-2.5" />{lead.location}</span>}
+                          {lead.phone    && <span className="text-[10px] text-emerald-400/80 flex items-center gap-0.5"><Phone className="w-2.5 h-2.5" />{lead.phone}</span>}
+                          {lead.email    && <span className="text-[10px] text-violet-400/70 flex items-center gap-0.5"><Mail className="w-2.5 h-2.5" />{lead.email}</span>}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        {i === 0 && <span className="text-[9px] font-bold uppercase bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 px-1.5 py-px rounded-full">new</span>}
+                        <ScoreDot score={lead.score} />
                       </div>
                     </div>
-                    <ScoreDot score={lead.score} />
-                  </div>
-                ))}
-                {leads.length > 20 && <div className="px-4 py-2.5 text-center text-[10px] text-white/20">+{leads.length - 20} more</div>}
-              </div>
+                  ))}
+                  {leads.length > 25 && (
+                    <div className="px-4 py-2.5 text-center text-[10px] text-white/20">
+                      +{leads.length - 25} more — view all in the Leads tab after scrape finishes
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -1553,13 +1774,13 @@ export default function Services() {
             {/* Stats row */}
             <div className="grid grid-cols-3 sm:grid-cols-7 gap-2">
               {[
-                { label: "Total",          value: stats.total,     icon: Database,   color: "text-blue-400" },
-                { label: "Craigslist",     value: stats.cl,        icon: Globe,      color: "text-orange-400" },
-                { label: "FB Groups",      value: stats.fb,        icon: Users,      color: "text-indigo-400" },
-                { label: "Google",         value: stats.google,    icon: Search,     color: "text-sky-400" },
-                { label: "Phones",         value: stats.withPhone, icon: Phone,      color: "text-emerald-400" },
-                { label: "Emails",         value: stats.withEmail, icon: Mail,       color: "text-violet-400" },
-                { label: "Avg Score",      value: stats.avgScore,  icon: TrendingUp, color: "text-amber-400" },
+                { label: "Total",      value: stats.total,     icon: Database,   color: "text-blue-400" },
+                { label: "Craigslist", value: stats.cl,        icon: Globe,      color: "text-orange-400" },
+                { label: "FB Groups",  value: stats.fb,        icon: Users,      color: "text-indigo-400" },
+                { label: "Google",     value: stats.google,    icon: Search,     color: "text-sky-400" },
+                { label: "Phones",     value: stats.withPhone, icon: Phone,      color: "text-emerald-400" },
+                { label: "Emails",     value: stats.withEmail, icon: Mail,       color: "text-violet-400" },
+                { label: "Avg Score",  value: stats.avgScore,  icon: TrendingUp, color: "text-amber-400" },
               ].map(({ label, value, icon: Icon, color }) => (
                 <div key={label} className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-3">
                   <div className={`${color} mb-1.5`}><Icon className="w-3.5 h-3.5" /></div>
@@ -1581,8 +1802,8 @@ export default function Services() {
                   <button key={t.id} onClick={() => setActiveTab(t.id)} className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold transition-all ${activeTab === t.id ? "bg-white/10 text-white" : "text-white/30 hover:text-white/60"}`}>
                     <t.icon className="w-3.5 h-3.5" />
                     <span className="hidden sm:inline">{t.label}</span>
-                    {t.id === "leads"  && filtered.length > 0   && <span className="bg-white/10 text-white/60 px-1.5 rounded-full text-[10px]">{filtered.length}</span>}
-                    {t.id === "groups" && fbGroupCount > 0 && <span className="bg-indigo-500/20 text-indigo-400 px-1.5 rounded-full text-[10px]">{fbGroupCount}</span>}
+                    {t.id === "leads"  && filtered.length > 0 && <span className="bg-white/10 text-white/60 px-1.5 rounded-full text-[10px]">{filtered.length}</span>}
+                    {t.id === "groups" && fbGroupCount > 0   && <span className="bg-indigo-500/20 text-indigo-400 px-1.5 rounded-full text-[10px]">{fbGroupCount}</span>}
                   </button>
                 ))}
               </div>
@@ -1600,7 +1821,7 @@ export default function Services() {
               </div>
             </div>
 
-            {/* ── Leads tab ── */}
+            {/* Leads tab */}
             {activeTab === "leads" && (
               <div>
                 {loading ? (
@@ -1627,7 +1848,7 @@ export default function Services() {
               </div>
             )}
 
-            {/* ── Groups tab — full management panel ── */}
+            {/* Groups tab */}
             {activeTab === "groups" && (
               <FbGroupsPanel
                 headers={headers}
@@ -1640,7 +1861,7 @@ export default function Services() {
               />
             )}
 
-            {/* ── Map tab ── */}
+            {/* Map tab */}
             {activeTab === "map" && (
               <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
                 <div className="px-4 py-3 border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-2">
@@ -1679,7 +1900,7 @@ export default function Services() {
               </div>
             )}
 
-            {/* ── History tab ── */}
+            {/* History tab */}
             {activeTab === "history" && (
               <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
                 <div className="px-5 py-4 border-b border-white/[0.06]"><span className="text-sm font-semibold">Scrape History</span></div>
@@ -1720,7 +1941,6 @@ export default function Services() {
         </main>
       </div>
 
-      {/* Global lead detail modal */}
       {selectedLead && <LeadDetailModal lead={selectedLead} onClose={() => setSelectedLead(null)} updateStatus={updateLeadStatus} />}
     </div>
   );

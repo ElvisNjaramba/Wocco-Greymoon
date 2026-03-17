@@ -70,7 +70,7 @@ US_CITY_STRUCTURE = {
 
     "Colorado": {"name": "Colorado", "regions": [
         {"code": "boulder",        "name": "Boulder"},
-        {"code": "cosprings",      "name": "Colorado Springs"},   # was coloradosprings — WRONG
+        {"code": "cosprings",      "name": "Colorado Springs"},
         {"code": "denver",         "name": "Denver"},
         {"code": "eastco",         "name": "Eastern CO"},
         {"code": "fortcollins",    "name": "Fort Collins"},
@@ -98,7 +98,7 @@ US_CITY_STRUCTURE = {
         {"code": "daytona",     "name": "Daytona Beach"},
         {"code": "fortmyers",   "name": "Fort Myers / SW Florida"},
         {"code": "gainesville", "name": "Gainesville"},
-        {"code": "cfl",         "name": "Heartland Florida"},       # was heartland — WRONG
+        {"code": "cfl",         "name": "Heartland Florida"},
         {"code": "jacksonville","name": "Jacksonville"},
         {"code": "keys",        "name": "Florida Keys"},
         {"code": "lakeland",    "name": "Lakeland"},
@@ -112,7 +112,7 @@ US_CITY_STRUCTURE = {
         {"code": "staugustine", "name": "St. Augustine"},
         {"code": "tallahassee", "name": "Tallahassee"},
         {"code": "tampa",       "name": "Tampa Bay Area"},
-        {"code": "treasure",    "name": "Treasure Coast"},           # was treasurecoast — WRONG
+        {"code": "treasure",    "name": "Treasure Coast"},
     ]},
 
     "Georgia": {"name": "Georgia", "regions": [
@@ -150,7 +150,7 @@ US_CITY_STRUCTURE = {
         {"code": "peoria",      "name": "Peoria"},
         {"code": "rockford",    "name": "Rockford"},
         {"code": "carbondale",  "name": "Southern Illinois"},
-        {"code": "springfieldil","name": "Springfield"},           # was springfield — clashes with MO
+        {"code": "springfieldil","name": "Springfield"},
         {"code": "quincy",      "name": "Western IL"},
     ]},
 
@@ -160,7 +160,7 @@ US_CITY_STRUCTURE = {
         {"code": "fortwayne",   "name": "Fort Wayne"},
         {"code": "indianapolis","name": "Indianapolis"},
         {"code": "kokomo",      "name": "Kokomo"},
-        {"code": "tippecanoe",  "name": "Lafayette / West Lafayette"}, # was missing
+        {"code": "tippecanoe",  "name": "Lafayette / West Lafayette"},
         {"code": "muncie",      "name": "Muncie / Anderson"},
         {"code": "richmondin",  "name": "Richmond"},
         {"code": "southbend",   "name": "South Bend"},
@@ -450,7 +450,7 @@ US_CITY_STRUCTURE = {
         {"code": "chattanooga", "name": "Chattanooga"},
         {"code": "clarksville", "name": "Clarksville"},
         {"code": "cookeville",  "name": "Cookeville"},
-        {"code": "jacksontn",   "name": "Jackson"},              # was jackson — clashes with MS
+        {"code": "jacksontn",   "name": "Jackson"},
         {"code": "knoxville",   "name": "Knoxville"},
         {"code": "memphis",     "name": "Memphis"},
         {"code": "nashville",   "name": "Nashville"},
@@ -480,7 +480,7 @@ US_CITY_STRUCTURE = {
         {"code": "sanantonio",    "name": "San Antonio"},
         {"code": "sanmarcos",     "name": "San Marcos"},
         {"code": "texoma",        "name": "Texoma"},
-        {"code": "easttexas",     "name": "Tyler / East TX"},    # was easttx — WRONG
+        {"code": "easttexas",     "name": "Tyler / East TX"},
         {"code": "victoriatx",    "name": "Victoria"},
         {"code": "waco",          "name": "Waco"},
         {"code": "wichitafalls",  "name": "Wichita Falls"},
@@ -488,7 +488,7 @@ US_CITY_STRUCTURE = {
 
     "Utah": {"name": "Utah", "regions": [
         {"code": "logan",        "name": "Logan"},
-        {"code": "ogden",        "name": "Ogden-Clearfield"},    # was ogden-clearfield — WRONG
+        {"code": "ogden",        "name": "Ogden-Clearfield"},
         {"code": "provo",        "name": "Provo / Orem"},
         {"code": "saltlakecity", "name": "Salt Lake City"},
         {"code": "stgeorge",     "name": "St. George"},
@@ -502,7 +502,7 @@ US_CITY_STRUCTURE = {
         {"code": "charlottesville","name": "Charlottesville"},
         {"code": "danville",       "name": "Danville"},
         {"code": "fredericksburg", "name": "Fredericksburg"},
-        {"code": "norfolk",        "name": "Hampton Roads"},      # was washingtondc — WRONG
+        {"code": "norfolk",        "name": "Hampton Roads"},
         {"code": "harrisonburg",   "name": "Harrisonburg"},
         {"code": "lynchburg",      "name": "Lynchburg"},
         {"code": "richmond",       "name": "Richmond"},
@@ -549,3 +549,32 @@ US_CITY_STRUCTURE = {
         {"code": "wyoming",    "name": "Wyoming"},
     ]},
 }
+
+
+def get_city_options(city_structure: dict = None) -> list[dict]:
+    """
+    Returns a flat list of {code, name} dicts with state appended to the
+    display name, e.g. {"code": "bham", "name": "Birmingham, Alabama"}.
+
+    Preserves the original state-by-state ordering from US_CITY_STRUCTURE.
+    Pass a custom dict to override; defaults to the module-level structure.
+    """
+    if city_structure is None:
+        city_structure = US_CITY_STRUCTURE
+    options = []
+    for state_data in city_structure.values():
+        state_name = state_data["name"]
+        for region in state_data["regions"]:
+            options.append({
+                "code": region["code"],
+                "name": f"{region['name']}, {state_name}",
+            })
+    return options
+
+
+def get_city_options_sorted(city_structure: dict = None) -> list[dict]:
+    """
+    Same as get_city_options() but sorted alphabetically by display name.
+    Useful when the dropdown is not grouped and users scan by city name.
+    """
+    return sorted(get_city_options(city_structure), key=lambda x: x["name"])
