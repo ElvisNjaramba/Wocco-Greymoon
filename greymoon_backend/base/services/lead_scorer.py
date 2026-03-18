@@ -23,11 +23,7 @@ PREMIUM_CATEGORIES = [
 
 
 def calculate_lead_score(item: dict) -> tuple[int, dict]:
-    """
-    Score a normalized lead dict (from normalizer.py).
-    Returns (score: int, reasons: dict).
-    Works for both CRAIGSLIST and FACEBOOK sources.
-    """
+
     score = 0
     reasons = {}
 
@@ -35,8 +31,6 @@ def calculate_lead_score(item: dict) -> tuple[int, dict]:
     title = (item.get("title") or "").lower()
     description = (item.get("post") or "").lower()
     combined_text = title + " " + description
-
-    # ── Contact signals (highest value — these are actual leads) ──
 
     if item.get("phone"):
         score += 30
@@ -46,8 +40,6 @@ def calculate_lead_score(item: dict) -> tuple[int, dict]:
         score += 15
         reasons["email"] = 15
 
-    # ── Location precision ────────────────────────────────────────
-
     if item.get("latitude") and item.get("longitude"):
         score += 10
         reasons["geolocation"] = 10
@@ -55,22 +47,16 @@ def calculate_lead_score(item: dict) -> tuple[int, dict]:
         score += 3
         reasons["location_text"] = 3
 
-    # ── Category match ────────────────────────────────────────────
-
     if item.get("service_category") in PREMIUM_CATEGORIES or \
        item.get("category") in PREMIUM_CATEGORIES:
         score += 10
         reasons["premium_category"] = 10
-
-    # ── Urgency / quality keywords ────────────────────────────────
 
     matched_keywords = [w for w in HIGH_VALUE_KEYWORDS if w in combined_text]
     if matched_keywords:
         keyword_score = min(len(matched_keywords) * 5, 20)
         score += keyword_score
         reasons["keywords"] = keyword_score
-
-    # ── Freshness ─────────────────────────────────────────────────
 
     post_date = item.get("datetime")
     if post_date:
@@ -86,20 +72,15 @@ def calculate_lead_score(item: dict) -> tuple[int, dict]:
         except Exception:
             pass
 
-    # ── Source-specific signals ───────────────────────────────────
-
     if source == "FACEBOOK":
-        # FB posts with both phone AND location text are gold
         if item.get("phone") and item.get("location"):
             score += 5
             reasons["fb_contact_with_location"] = 5
 
     elif source == "CRAIGSLIST":
-        # CL map accuracy suggests they verified their location
         if item.get("map_accuracy"):
             score += 3
             reasons["cl_map_accuracy"] = 3
 
-    # Cap at 100
     score = min(score, 100)
     return score, reasons

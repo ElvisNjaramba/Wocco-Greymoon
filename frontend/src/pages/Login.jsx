@@ -1,47 +1,3 @@
-// import { useContext, useState, useEffect } from "react";
-// import { useNavigate } from "react-router-dom";
-// import { AuthContext } from "../context/AuthContext";
-
-// export default function Login() {
-//   const { login, user } = useContext(AuthContext);
-//   const navigate = useNavigate();
-//   const [form, setForm] = useState({ username: "", password: "" });
-
-//   // Redirect if already logged in
-//   useEffect(() => {
-//     if (user) {
-//       navigate("/"); // Redirect to home page
-//     }
-//   }, [user, navigate]);
-
-//   const handleSubmit = async (e) => {
-//     e.preventDefault();
-//     await login(form.username, form.password);
-//     // No need to navigate here, useEffect will handle it
-//   };
-
-//   return (
-//     <>
-//       <form onSubmit={handleSubmit}>
-//         <input
-//           placeholder="Username"
-//           onChange={(e) => setForm({ ...form, username: e.target.value })}
-//         />
-//         <input
-//           type="password"
-//           placeholder="Password"
-//           onChange={(e) => setForm({ ...form, password: e.target.value })}
-//         />
-//         <button>Login</button>
-//       </form>
-//       <p>
-//         Don't have an account? <a href="/register">Register</a>
-//       </p>
-//     </>
-//   );
-// }
-
-
 import { useContext, useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { AuthContext } from "../context/AuthContext";
@@ -188,7 +144,6 @@ export default function Login() {
             </div>
           </div>
 
-          {/* Register Link */}
           <p className="text-center">
             <a 
               href="/register" 
@@ -200,7 +155,6 @@ export default function Login() {
           </p>
         </div>
 
-        {/* Footer */}
         <div className="bg-gray-50 px-8 py-4 border-t border-gray-200">
           <p className="text-xs text-gray-500 text-center">
             By signing in, you agree to our Terms of Service and Privacy Policy

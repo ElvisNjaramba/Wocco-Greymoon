@@ -12,7 +12,6 @@ import {
 
 const API = "http://127.0.0.1:8000/api";
 
-// ── Nominatim geocoder ────────────────────────────────────────
 const _geocodeCache = {};
 let _lastGeoReq = 0;
 async function geocodeLocation(locationStr) {
@@ -39,7 +38,6 @@ async function geocodeLocation(locationStr) {
   return null;
 }
 
-// ── Service taxonomy ──────────────────────────────────────────
 const SERVICE_TAXONOMY = {
   "Cleaning": {
     services: [
@@ -116,7 +114,6 @@ const SOURCE_CFG = {
   GOOGLE:     { label: "GG",  badge: "bg-sky-500/10 text-sky-400 border-sky-500/20",           pill: "bg-sky-500/15 border-sky-500/40 text-sky-300",           pillIdle: "bg-sky-500/8 border-sky-500/20 text-sky-400/60",           hero: "border-sky-500/30 bg-gradient-to-br from-sky-950/30 to-[#0f1117]",         line: "bg-gradient-to-r from-transparent via-sky-400/80 to-transparent animate-pulse",     nav: "bg-sky-500/10 border-sky-500/25 text-sky-400",         icon: Search, mapColor: "text-sky-600",     emoji: "🔍", name: "Google Search",     counterColor: "text-sky-400",    counterBg: "bg-sky-500/10 border-sky-500/20" },
 };
 
-// ── Parse source_stats from activity_log (fallback) ───────────
 function parseSourceStatsFromLog(activityLog) {
   const stats = {};
   for (const entry of (activityLog || [])) {
@@ -130,10 +127,6 @@ function parseSourceStatsFromLog(activityLog) {
   return stats;
 }
 
-// ── Per-source live counter card ──────────────────────────────
-// Shows DB-saved count + live Apify dataset count while actor runs.
-// The Apify count is parsed from scrapeStatus.stage_detail which
-// pipeline.py writes as: "~47 result(s) found by Apify | 12 lead(s) saved to DB so far"
 function SourceCounter({ sourceKey, sourceStats, isActive, isDone, isQueued, scrapeStatus }) {
   const cfg = SOURCE_CFG[sourceKey];
   if (!cfg) return null;
@@ -144,9 +137,6 @@ function SourceCounter({ sourceKey, sourceStats, isActive, isDone, isQueued, scr
   const skipped = stats.skipped || 0;
   const Icon    = cfg.icon;
 
-  // Parse live Apify item count from stage_detail for ALL sources, not just active.
-  // pipeline.py writes: "~47 result(s) found by Apify | 12 lead(s) saved to DB so far"
-  // We show this on the card of whichever source is currently running.
   const apifyLiveCount = useMemo(() => {
     if (isDone) return null;
     if (!isActive) return null;
@@ -155,8 +145,6 @@ function SourceCounter({ sourceKey, sourceStats, isActive, isDone, isQueued, scr
     return match ? parseInt(match[1], 10) : null;
   }, [isActive, isDone, scrapeStatus?.stage_detail]);
 
-  // The "hero" number: if Apify is returning results live, show that count big.
-  // Once leads are saved to DB, show those too.
   const heroNumber  = apifyLiveCount !== null && apifyLiveCount > 0 ? apifyLiveCount : saved;
   const heroIsApify = apifyLiveCount !== null && apifyLiveCount > 0;
 
@@ -200,12 +188,10 @@ function SourceCounter({ sourceKey, sourceStats, isActive, isDone, isQueued, scr
         {isDone && <span className="ml-auto text-[9px] text-emerald-400/50">done</span>}
       </div>
 
-      {/* Hero number — Apify live count takes priority, falls back to DB saved */}
       <div className={`text-xl font-bold tabular-nums leading-none transition-all duration-300 ${numColor}`}>
         {heroIsApify ? `~${heroNumber}` : heroNumber}
       </div>
 
-      {/* Label under the big number */}
       {heroIsApify ? (
         <div className="text-[9px] mt-0.5 flex items-center gap-1" style={{ color: "currentColor", opacity: 0.5 }}>
           <span className="w-1 h-1 rounded-full animate-pulse inline-block flex-shrink-0" style={{ backgroundColor: "currentColor" }} />
@@ -215,7 +201,6 @@ function SourceCounter({ sourceKey, sourceStats, isActive, isDone, isQueued, scr
         <div className="text-[9px] text-white/20 mt-0.5">leads saved</div>
       )}
 
-      {/* Secondary row: if Apify count is shown as hero, also show how many are saved to DB */}
       {heroIsApify && saved > 0 && (
         <div className="mt-1.5 pt-1.5 border-t border-white/[0.06] flex items-center gap-1">
           <span className={`text-xs font-bold tabular-nums ${cfg.counterColor}`}>{saved}</span>
@@ -230,7 +215,6 @@ function SourceCounter({ sourceKey, sourceStats, isActive, isDone, isQueued, scr
   );
 }
 
-// ── UI atoms ──────────────────────────────────────────────────
 const Badge = ({ children, color = "slate" }) => {
   const colors = { slate: "bg-slate-100 text-slate-700 border-slate-200", blue: "bg-blue-50 text-blue-700 border-blue-200", green: "bg-emerald-50 text-emerald-700 border-emerald-200", yellow: "bg-amber-50 text-amber-700 border-amber-200", red: "bg-red-50 text-red-700 border-red-200" };
   return <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold border ${colors[color]}`}>{children}</span>;

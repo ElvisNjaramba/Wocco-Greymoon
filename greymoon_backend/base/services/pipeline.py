@@ -1,14 +1,3 @@
-"""
-pipeline.py  —  manual-groups-only Facebook integration
-────────────────────────────────────────────────────────
-Changes:
-  • _make_progress_callback: fires every ~10s from inside Apify poll loops,
-    updates stage_detail with live "~N items found by Apify / M saved to DB"
-    so the frontend can show real-time counts before a batch completes.
-  • progress_callback wired into all three scrapers (CL, FB, Google).
-  • All other logic unchanged.
-"""
-
 import threading
 from datetime import datetime, timezone
 from .location_resolver import resolve_location, LocationResolutionError
@@ -25,9 +14,6 @@ GOOGLE_CATEGORY_QUERIES = {
     "maintenance":      "home maintenance handyman contractor",
     "waste_management": "junk removal waste management contractor",
 }
-
-
-# ── Logging helper ────────────────────────────────────────────
 
 def _log(scrape_run_id, stage: str, detail: str, level: str = "info", extra: dict = None):
     ts    = datetime.now(timezone.utc).isoformat()
@@ -54,10 +40,6 @@ def _log(scrape_run_id, stage: str, detail: str, level: str = "info", extra: dic
 
 
 def _emit_source_stats(scrape_run_id, source: str, saved: int, skipped: int, batch_saved: int = 0):
-    """
-    Emit a structured source_stats log entry so the frontend can parse
-    per-source totals from the activity log in real time.
-    """
     if not scrape_run_id:
         return
     try:
@@ -94,19 +76,8 @@ def _emit_source_stats(scrape_run_id, source: str, saved: int, skipped: int, bat
         print(f"[Pipeline] Could not emit source stats: {e}")
 
 
-# ── Live progress callback ────────────────────────────────────
-
 def _make_progress_callback(scrape_run_id, source_label: str, stats: dict):
-    """
-    Returns a callback fired every ~10s from inside each scraper's Apify
-    poll loop with the current dataset item count from Apify.
 
-    Updates stage_detail immediately so the frontend sees it within 2s
-    via the /scrape/status/ poll — no need to wait for a batch to finish.
-
-    Format shown in the UI hero card stageDetail:
-        "~47 results found by Apify | 12 saved to DB so far"
-    """
     def callback(apify_count: int):
         if not scrape_run_id:
             return
@@ -125,7 +96,6 @@ def _make_progress_callback(scrape_run_id, source_label: str, stats: dict):
     return callback
 
 
-# ── Service logger ─────────────────────────────────────────────
 
 class _ServiceLogger:
     def __init__(self, scrape_run_id, default_stage="Background"):
@@ -153,8 +123,6 @@ class _ServiceLogger:
         _log(self._run_id, stage, detail, level=level)
 
 
-# ── Cancel helper ─────────────────────────────────────────────
-
 def _cancelled(scrape_run_id) -> bool:
     if not scrape_run_id:
         return False
@@ -167,14 +135,7 @@ def _cancelled(scrape_run_id) -> bool:
         return False
 
 
-# ── Batch save helper ─────────────────────────────────────────
-
 def _save_lead_batch(normalized_items, stats, scrape_run_id=None, source_key: str = None):
-    """
-    Save a list of normalised lead dicts to ServiceLead.
-    Dedup via content_hash and post_id.
-    Updates run counter after every individual lead for live UI counts.
-    """
     from base.models import ServiceLead, ScrapeRun
 
     if not normalized_items:
@@ -263,7 +224,6 @@ def _save_lead_batch(normalized_items, stats, scrape_run_id=None, source_key: st
             if post_id:
                 existing_ids.add(post_id)
 
-            # Update run counter after EVERY lead so UI is live
             if scrape_run_id:
                 try:
                     ScrapeRun.objects.filter(pk=scrape_run_id).update(
@@ -285,7 +245,6 @@ def _save_lead_batch(normalized_items, stats, scrape_run_id=None, source_key: st
         _emit_source_stats(scrape_run_id, source_key, src_saved, src_skipped, batch_saved_count)
 
 
-# ── Google contact enrichment (background thread) ─────────────
 
 def _enrich_saved_google_leads(contacts_map: dict, scrape_run_id, log):
     if not contacts_map:
@@ -339,7 +298,6 @@ def _enrich_saved_google_leads(contacts_map: dict, scrape_run_id, log):
         log(f"[Google Website Crawl] Enrichment update error: {e}")
 
 
-# ── FB batch processor ────────────────────────────────────────
 
 def _process_and_save_fb_batch(
     chunk_urls,
@@ -434,7 +392,6 @@ def _process_and_save_fb_batch(
     )
 
 
-# ── Main pipeline ─────────────────────────────────────────────
 
 def run_pipeline(
     location_type,
@@ -458,7 +415,6 @@ def run_pipeline(
     }
     svc_log = _ServiceLogger(scrape_run_id)
 
-    # ── Step 1: Resolve location ──────────────────────────────
     if location_value:
         _log(
             scrape_run_id, "Resolving location",
@@ -489,7 +445,6 @@ def run_pipeline(
             "No location set — Facebook-only run.", level="info",
         )
 
-    # ── Step 2: Resolve categories ────────────────────────────
     cl_codes = get_craigslist_codes(categories) if categories else []
     if categories:
         _log(
@@ -497,7 +452,6 @@ def run_pipeline(
             f"{', '.join(categories)} → {len(cl_codes)} CL code(s)",
         )
 
-    # ── Step 3: Craigslist ────────────────────────────────────
     if "craigslist" in sources and cl_cities and cl_codes:
         total_batches = -(-len(cl_cities) // 3)
         _log(
@@ -589,7 +543,6 @@ def run_pipeline(
             level="warning",
         )
 
-    # ── Step 4: Facebook ──────────────────────────────────────
     if "facebook" in sources:
         manual_group_urls = [u.strip() for u in (fb_group_urls or []) if u.strip()]
 
@@ -613,7 +566,6 @@ def run_pipeline(
                 svc_log=svc_log,
             )
 
-    # ── Step 5: Google Search ─────────────────────────────────
     if "google" in sources:
         if not location_data:
             _log(
@@ -637,7 +589,6 @@ def run_pipeline(
                 svc_log=svc_log,
             )
 
-    # ── Step 6: Wrap up ───────────────────────────────────────
     if scrape_run_id:
         try:
             run = ScrapeRun.objects.get(pk=scrape_run_id)
@@ -664,9 +615,6 @@ def run_pipeline(
         level="success" if not stats["errors"] else "warning",
     )
     return stats
-
-
-# ── Facebook sub-pipeline ─────────────────────────────────────
 
 def _run_facebook_pipeline(
     *,
@@ -777,8 +725,6 @@ def _run_facebook_pipeline(
         _log(scrape_run_id, "Facebook — error", str(e), level="error")
         stats["errors"].append(f"Facebook: {str(e)}")
 
-
-# ── Google sub-pipeline ───────────────────────────────────────
 
 def _run_google_pipeline(
     *,

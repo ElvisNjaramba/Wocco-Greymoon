@@ -189,9 +189,6 @@ def _fuzzy_contains(text: str, phrase: str, threshold: float = 0.82) -> bool:
     phrase_words = phrase_l.split()
 
     if len(phrase_words) == 1:
-        # Single-word: character sliding window.
-        # Use a slightly tighter threshold (0.86) to prevent short-word
-        # false positives like "removel" matching "remodel".
         single_threshold = max(threshold, 0.86)
         pw = len(phrase_l)
         if pw <= len(text_l):
@@ -200,8 +197,6 @@ def _fuzzy_contains(text: str, phrase: str, threshold: float = 0.82) -> bool:
                 if difflib.SequenceMatcher(None, window, phrase_l).ratio() >= single_threshold:
                     return True
     else:
-        # Multi-word: word-level n-gram window
-        # Compare full n-gram chunk so word order and content both matter
         text_words = text_l.split()
         n = len(phrase_words)
         for start in range(len(text_words) - n + 1):
@@ -233,13 +228,10 @@ _STATE_ABBREVS = {
 
 _STATE_NAMES_LOWER = {v.lower() for v in _STATE_ABBREVS.values()}
 
-# Multi-word entries must appear before single-word so n-gram wins
 _KNOWN_LOCATIONS: list[str] = sorted([
-    # multi-word states
     "new hampshire", "new jersey", "new mexico", "new york",
     "north carolina", "north dakota", "south carolina", "south dakota",
     "west virginia", "rhode island", "district of columbia",
-    # single-word states
     "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
     "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
     "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
@@ -247,7 +239,6 @@ _KNOWN_LOCATIONS: list[str] = sorted([
     "mississippi", "missouri", "montana", "nebraska", "nevada", "ohio",
     "oklahoma", "oregon", "pennsylvania", "tennessee", "texas", "utah",
     "vermont", "virginia", "washington", "wisconsin", "wyoming",
-    # multi-word cities
     "los angeles", "san francisco", "san antonio", "san diego", "san jose",
     "las vegas", "new orleans", "kansas city", "virginia beach",
     "long beach", "colorado springs", "el paso", "fort worth",
@@ -256,7 +247,6 @@ _KNOWN_LOCATIONS: list[str] = sorted([
     "grand rapids", "little rock", "baton rouge", "jersey city",
     "salt lake city", "sioux falls", "des moines", "cedar rapids",
     "st petersburg", "saint petersburg",
-    # single major cities
     "houston", "dallas", "chicago", "phoenix", "philadelphia",
     "jacksonville", "columbus", "indianapolis", "seattle", "denver",
     "nashville", "boston", "portland", "memphis", "louisville",
@@ -277,7 +267,6 @@ _KNOWN_LOCATIONS: list[str] = sorted([
 ], key=lambda x: (0 if " " in x else 1, -len(x)))
 
 
-# ── Public API ────────────────────────────────────────────────
 
 def extract_categories(phrases: list[str]) -> list[str]:
 
@@ -297,12 +286,10 @@ def extract_location(phrases: list[str]) -> tuple[str | None, str | None]:
 
     combined = " ".join(phrases)
 
-    # ── 1. 2-letter state abbreviation ───────────────────────
     abbrev_m = re.search(r'\b([A-Z]{2})\b', combined)
     if abbrev_m and abbrev_m.group(1) in _STATE_ABBREVS:
         return "state", _STATE_ABBREVS[abbrev_m.group(1)]
 
-    # ── 2. Preposition-scoped extraction ─────────────────────
     prep_m = re.search(
         r'\b(?:in|near|around|for|at|within|serving|covering)\s+(.+?)(?:[,.]|$)',
         combined,
@@ -313,7 +300,6 @@ def extract_location(phrases: list[str]) -> tuple[str | None, str | None]:
         if result:
             return result
 
-    # ── 3. Full-phrase window scan ────────────────────────────
     result = _fuzzy_match_location_tokens(combined)
     if result:
         return result
@@ -335,7 +321,6 @@ def parse_custom_search(phrases: list[str]) -> dict:
     }
 
 
-# ── Internal helpers ──────────────────────────────────────────
 
 def _fuzzy_match_location_tokens(
     text: str,
@@ -349,15 +334,14 @@ def _fuzzy_match_location_tokens(
             window_tokens = words[start:start + n]
             window        = " ".join(window_tokens)
 
-            # Skip windows that are entirely service/stop words
+        
             if all(_is_service_word(w) for w in window_tokens):
                 continue
 
-            # Skip very short tokens
+        
             if len(window.strip()) < 3:
                 continue
 
-            # Fuzzy match against reference list
             best_score = 0.0
             best_ref   = None
             for ref in _KNOWN_LOCATIONS:
@@ -370,7 +354,7 @@ def _fuzzy_match_location_tokens(
 
             if best_score >= threshold and best_ref is not None:
                 loc_type = "state" if best_ref.lower() in _STATE_NAMES_LOWER else "city"
-                # Return the original user tokens, not the corrected ref
+            
                 return loc_type, window
 
     return None

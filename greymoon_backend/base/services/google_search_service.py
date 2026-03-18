@@ -1,9 +1,3 @@
-"""
-google_search_service.py
-
-Bugs fixed in previous version + live dataset count polling added.
-"""
-
 import threading
 import time
 import re
@@ -121,7 +115,6 @@ def _poll_run_status(run_id: str) -> str:
     return res.json()["data"]["status"]
 
 
-# ── Contact extraction ────────────────────────────────────────
 
 _PHONE_FORMATTED = re.compile(
     r'(\+?1?[\s\.\-]?[\(\-]?\d{3}[\)\.\-\s][\.\-\s]?\d{3}[\.\-\s]\d{4})'
@@ -177,7 +170,6 @@ def _base_domain(url: str) -> str:
         return url
 
 
-# ── SERP payload ──────────────────────────────────────────────
 
 def build_google_payload(
     query: str,
@@ -221,8 +213,6 @@ def build_crawl_payload(urls: list[str]) -> dict:
         },
     }
 
-
-# ── Parallel crawl thread ─────────────────────────────────────
 
 def _run_crawl_parallel(
     urls_to_crawl: list[str],
@@ -380,9 +370,6 @@ def _run_crawl_parallel(
     )
     crawl_done.set()
 
-
-# ── Main SERP generator ───────────────────────────────────────
-
 def scrape_google_search_progressive(
     queries: list[str],
     location: str,
@@ -394,13 +381,7 @@ def scrape_google_search_progressive(
     enrich_callback=None,
     progress_callback=None,
 ):
-    """
-    Generator — yields one bundle per query:
-        { "serp_pages": [...], "contacts_map": {} }
 
-    progress_callback(apify_item_count) is fired every ~10s while the
-    SERP actor is running so the pipeline can push live counts to the UI.
-    """
     log = _log_fn or print
 
     for i, query in enumerate(queries):
@@ -505,7 +486,6 @@ def scrape_google_search_progressive(
             + (", AI answer included" if has_ai else "")
         )
 
-        # ── Launch website crawler in background ──────────────
         contacts_map  = {}
         crawl_thread  = None
         crawl_done    = threading.Event()

@@ -1,10 +1,3 @@
-"""
-fb_service.py  —  Facebook post scraping (manual groups only)
-
-Phase A (group discovery via keyword search) has been removed.
-All group URLs are provided manually by the user.
-"""
-
 import time
 import requests
 from django.conf import settings
@@ -105,12 +98,7 @@ def _poll_until_done(
     log=None,
     progress_callback=None,
 ) -> str:
-    """
-    Poll actor status until terminal.
-    Every 2 polls (~10s) also checks the live dataset item count and
-    fires progress_callback(count) so the pipeline can update stage_detail.
-    Returns the final status string.
-    """
+
     poll_count = 0
     while True:
         if _is_cancel_requested(scrape_run_id):

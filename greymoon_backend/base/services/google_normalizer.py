@@ -1,29 +1,6 @@
-"""
-google_normalizer.py
-
-Maps raw Google Search Results Scraper output → unified ServiceLead dicts.
-
-Handles all result types:
-  - organicResults[]       standard organic results
-  - businessLeads[]        enriched contacts (leads enrichment add-on)
-  - aiModeResult{}         Google AI Mode answer + sources
-  - aiOverview{}           AI Overview snippet + sources
-  - peopleAlsoAsk[]        PAA questions + answers (useful for scoring/context)
-  - paidResults[]          paid/ad results (contractors running ads = high intent)
-  - contacts_map{}         contacts extracted by website deep-scrape
-
-Priority order for contact data:
-  1. businessLeads enrichment (most reliable)
-  2. Website deep-scrape (phone/email from actual company site)
-  3. Snippet/description mining (fallback)
-"""
-
 import hashlib
 import json
 import re
-
-
-# ── Shared helpers ────────────────────────────────────────────
 
 def _extract_emails(text: str) -> str | None:
     if not text:
@@ -83,7 +60,6 @@ def _is_directory(url: str) -> bool:
     return any(d in url for d in SKIP_DOMAINS)
 
 
-# ── Lead builder ──────────────────────────────────────────────
 
 def _build_lead(
     *,
@@ -137,8 +113,6 @@ def _build_lead(
     return normalized
 
 
-# ── Contact resolution (enrichment > crawl > snippet) ─────────
-
 def _resolve_contacts(
     *,
     enrich_phone: str,
@@ -147,12 +121,7 @@ def _resolve_contacts(
     snippet: str,
     contacts_map: dict,
 ) -> tuple[str | None, str | None]:
-    """
-    Return (best_phone, best_email) using priority:
-      1. Leads enrichment data
-      2. Website deep-scrape contacts_map (keyed by base URL / domain)
-      3. Snippet/description mining
-    """
+
     phone = enrich_phone or ""
     email = enrich_email or ""
 
@@ -173,8 +142,6 @@ def _resolve_contacts(
 
     return phone or None, email or None
 
-
-# ── Per-result-type normalizers ───────────────────────────────
 
 def _from_enriched_lead(
     lead: dict,
@@ -281,10 +248,7 @@ def _from_paid_result(
     search_query: str,
     contacts_map: dict,
 ) -> dict | None:
-    """
-    Paid/ad results indicate contractors actively spending on ads —
-    high intent signal. Treat same as organic but tag as 'paid'.
-    """
+
     url   = result.get("url") or result.get("displayedUrl") or ""
     title = result.get("title") or ""
     desc  = result.get("description") or ""
@@ -313,11 +277,6 @@ def _from_paid_result(
 
 
 def _extract_ai_context(page: dict) -> str:
-    """
-    Pull text from AI Mode result and AI Overview for inclusion in
-    the post body of leads found on the same page — adds rich context.
-    Also returns source URLs from AI answers to cross-reference.
-    """
     lines = []
     ai_mode = page.get("aiModeResult") or {}
     if ai_mode.get("text"):
@@ -340,7 +299,6 @@ def _extract_ai_context(page: dict) -> str:
 
 
 def _ai_source_urls(page: dict) -> list[str]:
-    """Collect contractor URLs cited in AI Mode / AI Overview answers."""
     urls = []
     for block in [page.get("aiModeResult") or {}, page.get("aiOverview") or {}]:
         for src in block.get("sources") or []:
@@ -350,24 +308,12 @@ def _ai_source_urls(page: dict) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
-# ── Public entry point ────────────────────────────────────────
-
 def normalize_google_serp_page(
     page: dict,
     service_category: str,
     location: str,
     contacts_map: dict = None,
 ) -> list[dict]:
-    """
-    Takes one SERP page record + the contacts_map from website deep-scraping
-    and returns a list of unified lead dicts.
-
-    Processing order (deduped by URL):
-      1. Enriched business leads (highest quality)
-      2. AI Mode / AI Overview source URLs (cited contractor sites)
-      3. Organic results not already covered by enrichment
-      4. Paid results (contractors running ads)
-    """
     if contacts_map is None:
         contacts_map = {}
 

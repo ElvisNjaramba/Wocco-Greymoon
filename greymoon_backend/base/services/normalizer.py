@@ -4,11 +4,7 @@ import hashlib
 import re
 import json
 
-
-# ── Shared helpers ────────────────────────────────────────────
-
 def _extract_emails(text: str) -> str | None:
-    """Pull the first email address found in a block of text."""
     if not text:
         return None
     matches = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", text)
@@ -16,7 +12,6 @@ def _extract_emails(text: str) -> str | None:
 
 
 def _extract_phones(text: str) -> str | None:
-    """Pull the first phone number found in a block of text."""
     if not text:
         return None
     matches = re.findall(
@@ -26,17 +21,10 @@ def _extract_phones(text: str) -> str | None:
 
 
 def _content_hash(data: dict) -> str:
-    """Stable fingerprint for deduplication across runs and sources."""
     key = json.dumps(data, sort_keys=True, default=str)
     return hashlib.sha256(key.encode()).hexdigest()
 
-
-# ── Craigslist normalizer ─────────────────────────────────────
-
 def normalize_craigslist(item: dict, service_category: str) -> dict:
-    """
-    Map a raw Craigslist scraper result → unified lead dict.
-    """
     description = item.get("post") or item.get("description") or ""
     title = item.get("title") or ""
 
@@ -79,26 +67,13 @@ def normalize_craigslist(item: dict, service_category: str) -> dict:
 
     return normalized
 
-
-# ── Facebook normalizer ───────────────────────────────────────
-
 def normalize_facebook(
     item: dict,
     service_category: str,
     location_str: str,
     zip_code: str | None = None,
 ) -> dict:
-    """
-    Map a raw Facebook Groups Scraper result → unified lead dict.
 
-    Facebook posts don't always have phone/email in structured fields,
-    so we mine the post text aggressively.
-
-    zip_code (optional):
-        When the scrape was triggered by a ZIP-code search, pass the
-        ZIP here so it is stored on the lead for filtering/display.
-        We also attempt to extract a ZIP from the post text as a fallback.
-    """
     text = (
         item.get("text")
         or item.get("postText")
@@ -130,8 +105,6 @@ def normalize_facebook(
         or item.get("fbId")
         or ""
     )
-
-    # Build a meaningful title from what we have
     title = (
         item.get("title")
         or (text[:120].replace("\n", " ").strip() if text else f"Post by {author}")
@@ -148,7 +121,6 @@ def normalize_facebook(
         or None
     )
 
-    # ZIP resolution: explicit param wins; fall back to text extraction
     resolved_zip = zip_code or _extract_zip_from_text(text) or ""
 
     normalized = {
@@ -161,7 +133,7 @@ def normalize_facebook(
         "location":         location_str,
         "category":         service_category,
         "service_category": service_category,
-        "state":            "",        # not always available from FB
+        "state":            "",       
         "latitude":         str(item.get("latitude") or ""),
         "longitude":        str(item.get("longitude") or ""),
         "map_accuracy":     "",
@@ -181,8 +153,6 @@ def normalize_facebook(
 
     return normalized
 
-
-# ── Internal helpers ──────────────────────────────────────────
 
 def _extract_zip_from_text(text: str) -> str | None:
     """Pull the first 5-digit ZIP code from post text."""

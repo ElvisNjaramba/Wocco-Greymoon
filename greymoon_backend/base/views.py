@@ -1,10 +1,3 @@
-# ============================================================
-# views.py  —  full updated file
-# Changes vs previous version:
-#   • list_services: added date_from / date_to filters on created_at
-#   • export_leads:  same date_from / date_to filters + all prior filters
-# ============================================================
-
 import re
 import io
 import uuid
@@ -45,14 +38,7 @@ _STATE_NAME_TO_ABBREV = {
 }
 
 
-# ── Shared: apply all filters to a queryset ───────────────────
-
 def _apply_lead_filters(leads, params):
-    """
-    Apply every supported filter to a ServiceLead queryset.
-    params is request.query_params (or any dict-like).
-    Returns the filtered queryset.
-    """
     source = params.get("source")
     if source:
         leads = leads.filter(source=source.upper())
@@ -88,7 +74,6 @@ def _apply_lead_filters(leads, params):
     if fb_group:
         leads = leads.filter(fb_group_name__icontains=fb_group)
 
-    # date_after is used internally by the live-polling mechanism
     date_after = params.get("date_after")
     if date_after:
         try:
@@ -99,8 +84,6 @@ def _apply_lead_filters(leads, params):
         except Exception:
             pass
 
-    # date_from / date_to — user-facing date range filter on created_at
-    # Accepts YYYY-MM-DD format from the date picker
     date_from = params.get("date_from")
     if date_from:
         try:
@@ -122,9 +105,6 @@ def _apply_lead_filters(leads, params):
             pass
 
     return leads
-
-
-# ── Scrape: Start ─────────────────────────────────────────────
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
@@ -231,7 +211,6 @@ def manual_scrape(request):
     }, status=202)
 
 
-# ── Scrape: Cancel helpers ────────────────────────────────────
 
 def _sweep_and_abort(apify_headers: dict, already_aborted: set) -> list[str]:
     newly = []
@@ -263,8 +242,6 @@ def _sweep_and_abort(apify_headers: dict, already_aborted: set) -> list[str]:
             print(f"[Cancel] Sweep ({status_filter}) error: {e}")
     return newly
 
-
-# ── Scrape: Cancel ────────────────────────────────────────────
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
@@ -327,8 +304,6 @@ def cancel_scrape(request):
     })
 
 
-# ── Scrape: Status ─────────────────────────────────────────────
-
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def scrape_status(request):
@@ -369,7 +344,6 @@ def scrape_status(request):
     })
 
 
-# ── Scrape: History ───────────────────────────────────────────
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -390,8 +364,6 @@ def scrape_history(request):
         for r in runs
     ])
 
-
-# ── FB Groups: Add groups ─────────────────────────────────────
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
@@ -424,8 +396,6 @@ def add_fb_groups(request):
     })
 
 
-# ── FB Groups: List ───────────────────────────────────────────
-
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def list_scraped_groups(request):
@@ -448,9 +418,6 @@ def list_scraped_groups(request):
         g["group_name"] = _display_name(g["group_name"], g["group_url"])
 
     return Response({"groups": groups, "total": len(groups)})
-
-
-# ── FB Groups: Scrape selected ────────────────────────────────
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
@@ -500,7 +467,6 @@ def scrape_selected_groups(request):
     }, status=202)
 
 
-# ── FB Groups: Leads for a group ─────────────────────────────
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -525,7 +491,6 @@ def list_group_leads(request):
     })
 
 
-# ── FB Groups: Delete ─────────────────────────────────────────
 
 @api_view(["DELETE"])
 @permission_classes([IsAuthenticated])
@@ -537,14 +502,11 @@ def delete_scraped_group(request):
     return Response({"deleted": deleted})
 
 
-# ── Leads: List ───────────────────────────────────────────────
-
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def list_services(request):
     leads = ServiceLead.objects.all()
 
-    # Apply all shared filters (including date_from / date_to)
     leads = _apply_lead_filters(leads, request.query_params)
 
     ordering_param = request.query_params.get("ordering", "-created_at")
@@ -591,9 +553,6 @@ def list_services(request):
         "has_prev":    page > 1,
     })
 
-
-# ── Leads: Update status ──────────────────────────────────────
-
 @api_view(["PATCH"])
 @permission_classes([IsAuthenticated])
 def update_lead_status(request, post_id):
@@ -611,23 +570,14 @@ def update_lead_status(request, post_id):
     return Response({"message": "Status updated", "status": new_status})
 
 
-# ── Leads: Export to Excel ────────────────────────────────────
-
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def export_leads(request):
-    """
-    Export filtered leads to a formatted Excel file.
-    Accepts all the same filter params as list_services including
-    date_from / date_to so exports always match what's on screen.
-    """
     leads = ServiceLead.objects.all()
 
-    # Apply all shared filters
     leads = _apply_lead_filters(leads, request.query_params)
     leads = leads.order_by("-score", "-created_at")
 
-    # ── Build workbook ────────────────────────────────────────
     wb = Workbook()
     ws = wb.active
     ws.title = "Leads"
@@ -813,9 +763,6 @@ def export_leads(request):
     response["Content-Disposition"] = f'attachment; filename="{filename}"'
     return response
 
-
-# ── Meta: Cities ──────────────────────────────────────────────
-
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_cities(request):
@@ -833,9 +780,6 @@ def get_cities(request):
                 "display": f"{region['name']}, {abbrev}",
             })
     return Response({"cities": cities_data, "total": len(cities_data)})
-
-
-# ── Meta: Categories ──────────────────────────────────────────
 
 @api_view(["GET"])
 def get_categories(request):

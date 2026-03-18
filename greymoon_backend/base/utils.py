@@ -20,10 +20,6 @@ def extract_email(text):
 
 
 def make_content_hash(title, description, phone, email):
-    """
-    Creates a fingerprint based on content, not post ID.
-    Normalizes text so minor spacing/punctuation differences don't bypass the check.
-    """
     def normalize(text):
         if not text:
             return ""
