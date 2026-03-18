@@ -55,7 +55,6 @@ def _is_cancel_requested(scrape_run_id: int | None) -> bool:
 
 
 def _fetch_dataset_count(dataset_id: str) -> int:
-    """Poll Apify dataset metadata for current item count — no download needed."""
     try:
         resp = requests.get(
             f"https://api.apify.com/v2/datasets/{dataset_id}",
@@ -118,11 +117,7 @@ def wait_for_run(
     log_fn=None,
     progress_callback=None,
 ):
-    """
-    Poll actor status until terminal.
-    Every 2 polls (~10s) also checks the live dataset item count and
-    fires progress_callback(count) so the pipeline can update stage_detail.
-    """
+
     log        = log_fn or print
     url        = f"https://api.apify.com/v2/actor-runs/{run_id}"
     poll_count = 0
@@ -188,11 +183,7 @@ def scrape_craigslist_progressive(
     _log_fn=None,
     progress_callback=None,
 ):
-    """
-    Generator — yields one list[dict] of raw results per city batch.
-    progress_callback(apify_item_count) is fired every ~10s while
-    the Apify actor is running so the caller can surface live counts.
-    """
+
     log     = _log_fn or print
     batches = list(chunk_list(cities, MAX_CITIES_PER_RUN))
 
