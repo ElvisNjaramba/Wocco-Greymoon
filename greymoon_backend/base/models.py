@@ -107,6 +107,8 @@ class ScrapeRun(models.Model):
     # ── Results ───────────────────────────────────────────────────
     leads_collected = models.IntegerField(default=0)
     leads_skipped = models.IntegerField(default=0)
+    source_stats = models.JSONField(default=dict, blank=True)
+
 
     # ── FB scrape settings ───────────────────────────────────────
     max_posts_per_group = models.IntegerField(default=50)

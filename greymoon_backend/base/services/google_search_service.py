@@ -1,28 +1,7 @@
 """
 google_search_service.py
 
-Bugs fixed in this version
-──────────────────────────
-1. enrich_callback was never passed into scrape_google_search_progressive
-   from pipeline.py — contacts extracted by the crawler were written into
-   contacts_map but the callback to update already-saved leads was never
-   called.  Fixed: enrich_callback is now wired all the way through.
-
-2. Phone regex missed dot-separated numbers (555.123.4567) which are
-   extremely common on contractor websites.  Also missed bare 10-digit
-   numbers in href="tel:5551234567" links (the most reliable contact
-   signal on modern sites).  Fixed: three-pattern extraction approach.
-
-3. maxCrawlPagesPerCrawl was hard-coded to 5 but each batch sends up to
-   15 URLs (root + /contact + /contact-us per site × 5 sites).  Only
-   the first 5 pages were ever fetched — /contact pages were silently
-   skipped.  Fixed: maxCrawlPagesPerCrawl = len(urls) * 3.
-
-4. contacts_map keys are base-domain strings like "https://www.example.com"
-   but _enrich_saved_google_leads matched via url__startswith.  If a saved
-   lead had www. and the crawled page key didn't (or vice versa) the match
-   failed silently.  Fixed: normalise both sides by stripping www. before
-   storing/comparing.
+Bugs fixed in previous version + live dataset count polling added.
 """
 
 import threading
@@ -32,15 +11,14 @@ import requests
 
 from django.conf import settings
 
-# ── Actor IDs ─────────────────────────────────────────────────
 SERP_ACTOR_ID       = "apify~google-search-scraper"
 CRAWL_ACTOR_ID      = "apify~website-content-crawler"
 
 POLL_INTERVAL       = 5
 DATASET_FETCH_LIMIT = 500
 DEFAULT_MAX_PAGES   = 3
-CRAWL_TIMEOUT       = 480   # seconds to wait for crawler per query
-CRAWL_BATCH_SIZE    = 5     # sites per crawler actor run
+CRAWL_TIMEOUT       = 480
+CRAWL_BATCH_SIZE    = 5
 
 SKIP_DOMAINS = {
     "yelp.com", "angi.com", "thumbtack.com", "homeadvisor.com",
@@ -50,7 +28,6 @@ SKIP_DOMAINS = {
     "nextdoor.com", "google.com", "twitter.com", "x.com",
 }
 
-# ── Apify helpers ─────────────────────────────────────────────
 
 def _apify_headers() -> dict:
     return {"Authorization": f"Bearer {settings.APIFY_TOKEN}"}
@@ -121,6 +98,20 @@ def _fetch_dataset(dataset_id: str) -> list[dict]:
     return resp.json()
 
 
+def _fetch_dataset_count(dataset_id: str) -> int:
+    """Poll Apify dataset metadata for current item count — no download needed."""
+    try:
+        resp = requests.get(
+            f"https://api.apify.com/v2/datasets/{dataset_id}",
+            headers=_apify_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", {}).get("itemCount", 0)
+    except Exception:
+        return 0
+
+
 def _poll_run_status(run_id: str) -> str:
     res = requests.get(
         f"https://api.apify.com/v2/actor-runs/{run_id}",
@@ -131,25 +122,6 @@ def _poll_run_status(run_id: str) -> str:
 
 
 # ── Contact extraction ────────────────────────────────────────
-#
-# Three-pattern approach to maximise coverage on contractor websites:
-#
-#   Pattern 1 — formatted numbers with any separator (-, space, dot):
-#     Covers (555) 123-4567  555-123-4567  555.123.4567  555 123 4567
-#     +1-800-555-1234  1.800.555.1234  (555)123-4567
-#
-#   Pattern 2 — href="tel:" with formatted number:
-#     Covers <a href="tel:(555)123-4567"> style links.
-#
-#   Pattern 3 — href="tel:" with raw 10-digit number:
-#     Covers <a href="tel:5551234567"> which is the most common way
-#     modern websites embed click-to-call links.  The 10 digits are
-#     reformatted to (NXX) NXX-XXXX for storage consistency.
-#
-# Why not one regex?
-#   A single regex broad enough to catch dots AND bare digits would also
-#   match IP addresses (192.168.1.1), version numbers (3.14.159), and
-#   dates (2024.01.15).  Splitting by context avoids all false positives.
 
 _PHONE_FORMATTED = re.compile(
     r'(\+?1?[\s\.\-]?[\(\-]?\d{3}[\)\.\-\s][\.\-\s]?\d{3}[\.\-\s]\d{4})'
@@ -171,26 +143,16 @@ _EMAIL_SKIP = {
 
 
 def _extract_contacts(text: str) -> dict:
-    """
-    Extract phone numbers and email addresses from crawled page text.
-    Returns {"phones": [...], "emails": [...]}.
-    """
     if not text:
         return {"phones": [], "emails": []}
 
-    # Pattern 1: formatted numbers — dashes, spaces, or dots as separators
-    phones_formatted = [m.strip() for m in _PHONE_FORMATTED.findall(text)]
-
-    # Pattern 2: tel: href with formatted number (most reliable, check first)
-    phones_tel_fmt = _PHONE_TEL_HREF_FORMATTED.findall(text)
-
-    # Pattern 3: tel: href with raw 10 digits — reformat to (NXX) NXX-XXXX
-    phones_tel_raw = [
+    phones_formatted  = [m.strip() for m in _PHONE_FORMATTED.findall(text)]
+    phones_tel_fmt    = _PHONE_TEL_HREF_FORMATTED.findall(text)
+    phones_tel_raw    = [
         f"({d[:3]}) {d[3:6]}-{d[6:]}"
         for d in _PHONE_TEL_HREF_RAW.findall(text)
     ]
 
-    # Merge — tel: href results first (most reliable source), then formatted
     all_phones = list(dict.fromkeys(
         phones_tel_fmt + phones_tel_raw + phones_formatted
     ))
@@ -204,15 +166,10 @@ def _extract_contacts(text: str) -> dict:
 
 
 def _normalise_domain(base_url: str) -> str:
-    """
-    Strip www. so https://www.example.com and https://example.com
-    both map to the same contacts_map key.
-    """
     return base_url.replace("://www.", "://")
 
 
 def _base_domain(url: str) -> str:
-    """https://www.example.com/about  →  https://www.example.com"""
     try:
         parts = url.split("/")
         return f"{parts[0]}//{parts[2]}"
@@ -244,19 +201,7 @@ def build_google_payload(
     }
 
 
-# ── Crawler payload ───────────────────────────────────────────
-
 def build_crawl_payload(urls: list[str]) -> dict:
-    """
-    Build crawler input for a batch of contractor URLs.
-
-    Queues root + /contact + /contact-us for every site.
-
-    Bug fix: maxCrawlPagesPerCrawl is now len(urls) * 3 instead of the
-    previous hard-coded 5.  With 5 sites per batch = 15 queued URLs,
-    the old limit of 5 meant only root pages were ever fetched and
-    /contact pages were silently dropped.
-    """
     start_urls = []
     for u in urls:
         base = u.rstrip("/")
@@ -266,7 +211,7 @@ def build_crawl_payload(urls: list[str]) -> dict:
 
     return {
         "startUrls":             start_urls,
-        "maxCrawlPagesPerCrawl": len(urls) * 3,   # ← was hard-coded 5
+        "maxCrawlPagesPerCrawl": len(urls) * 3,
         "maxCrawlDepth":         1,
         "crawlerType":           "playwright:chrome",
         "proxyConfiguration": {
@@ -284,16 +229,10 @@ def _run_crawl_parallel(
     contacts_map: dict,
     contacts_lock: threading.Lock,
     crawl_done: threading.Event,
-    enrich_callback,        # callable(contacts_map) called after each batch
+    enrich_callback,
     scrape_run_id,
     log,
 ):
-    """
-    Runs in a background thread alongside the SERP actor.
-    Crawls sites in batches and writes contacts into contacts_map
-    immediately after each batch.  Calls enrich_callback after every
-    batch so pipeline.py can update already-saved leads in real time.
-    """
     total = len(urls_to_crawl)
     log(
         f"[Google Website Crawl] Starting crawler on {total} contractor site(s) "
@@ -377,7 +316,6 @@ def _run_crawl_parallel(
                     )
                 time.sleep(POLL_INTERVAL)
 
-        # Always fetch whatever was crawled — even on failure/cancel
         try:
             pages = _fetch_dataset(dataset_id)
         except Exception as e:
@@ -401,8 +339,6 @@ def _run_crawl_parallel(
             if not contacts["phones"] and not contacts["emails"]:
                 continue
 
-            # Store under normalised key (no www.) so it matches saved
-            # lead URLs regardless of whether they include www.
             base     = _base_domain(page_url)
             norm_key = _normalise_domain(base)
 
@@ -426,8 +362,6 @@ def _run_crawl_parallel(
             f"across {len(contacts_map)} site(s))"
         )
 
-        # Call enrich_callback after every batch so pipeline.py updates
-        # already-saved leads with freshly extracted contact data
         if enrich_callback and contacts_map:
             try:
                 with contacts_lock:
@@ -458,16 +392,14 @@ def scrape_google_search_progressive(
     scrape_run_id=None,
     _log_fn=None,
     enrich_callback=None,
+    progress_callback=None,
 ):
     """
-    Generator — yields one bundle per query as soon as the SERP finishes:
-
+    Generator — yields one bundle per query:
         { "serp_pages": [...], "contacts_map": {} }
 
-    The website crawler runs in a background thread and populates
-    contacts_map incrementally.  enrich_callback(contacts_map) is called
-    after each crawl batch so pipeline.py can update already-saved leads
-    with contact data as it arrives.
+    progress_callback(apify_item_count) is fired every ~10s while the
+    SERP actor is running so the pipeline can push live counts to the UI.
     """
     log = _log_fn or print
 
@@ -484,7 +416,6 @@ def scrape_google_search_progressive(
             f"leads enrichment {'on' if enrich_leads else 'off'})"
         )
 
-        # ── Launch SERP actor ──────────────────────────────────
         payload = build_google_payload(
             query, location,
             max_pages=max_pages,
@@ -503,7 +434,7 @@ def scrape_google_search_progressive(
         serp_run_id, serp_dataset_id = serp_result
         log(f"[Google Search] SERP actor launched (run {serp_run_id}) — waiting for results...")
 
-        # ── Poll SERP to completion ────────────────────────────
+        # ── Poll SERP with live count updates ─────────────────
         serp_pages = []
         serp_poll  = 0
         serp_ok    = False
@@ -528,19 +459,26 @@ def scrape_google_search_progressive(
                 continue
 
             serp_poll += 1
+
+            # Live item count every 2 polls (~10s)
+            if serp_poll % 2 == 0:
+                count = _fetch_dataset_count(serp_dataset_id)
+                if count > 0 and progress_callback:
+                    progress_callback(count)
+                if serp_poll % 4 == 0:
+                    log(
+                        f"[Google Search] SERP running ({serp_poll * POLL_INTERVAL}s) — "
+                        f"~{count} SERP page(s) collected so far…"
+                    )
+
             if status == "SUCCEEDED":
                 serp_ok = True
                 break
             elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
                 log(f"[Google Search] SERP actor ended with: {status}")
                 break
-            else:
-                if serp_poll % 3 == 0:
-                    log(
-                        f"[Google Search] SERP running ({serp_poll * POLL_INTERVAL}s) — "
-                        f"Google is processing the query..."
-                    )
-                time.sleep(POLL_INTERVAL)
+
+            time.sleep(POLL_INTERVAL)
 
         try:
             serp_pages = _fetch_dataset(serp_dataset_id)
@@ -567,7 +505,7 @@ def scrape_google_search_progressive(
             + (", AI answer included" if has_ai else "")
         )
 
-        # ── Launch website crawler IN BACKGROUND ──────────────
+        # ── Launch website crawler in background ──────────────
         contacts_map  = {}
         crawl_thread  = None
         crawl_done    = threading.Event()
@@ -586,7 +524,6 @@ def scrape_google_search_progressive(
                         domain = url.split("/")[2]
                     except IndexError:
                         continue
-                    # Normalise domain for dedup (strip www.)
                     norm_domain = domain.replace("www.", "", 1)
                     if norm_domain not in seen_domains:
                         seen_domains.add(norm_domain)
@@ -604,7 +541,7 @@ def scrape_google_search_progressive(
                         contacts_map,
                         contacts_lock,
                         crawl_done,
-                        enrich_callback,    # ← wired through correctly
+                        enrich_callback,
                         scrape_run_id,
                         log,
                     ),
@@ -617,10 +554,6 @@ def scrape_google_search_progressive(
         else:
             crawl_done.set()
 
-        # ── Yield SERP results IMMEDIATELY ────────────────────
-        # contacts_map is likely empty here — that is intentional.
-        # pipeline.py saves the leads now; enrich_callback fills in
-        # contacts as each crawl batch finishes.
         with contacts_lock:
             snapshot = dict(contacts_map)
 
@@ -633,15 +566,12 @@ def scrape_google_search_progressive(
         )
         yield {"serp_pages": serp_pages, "contacts_map": snapshot}
 
-        # ── Wait for crawler to finish (capped) ───────────────
         if crawl_thread and not crawl_done.wait(timeout=CRAWL_TIMEOUT):
             log(
                 f"[Google Search] Website crawl timeout ({CRAWL_TIMEOUT}s) — "
                 f"moving to next query; crawler thread continues enriching in background"
             )
 
-        # Final enrich pass once crawler fully finishes — catches any
-        # batches that completed after the initial yield
         with contacts_lock:
             final_snapshot = dict(contacts_map)
 

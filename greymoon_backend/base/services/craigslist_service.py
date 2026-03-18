@@ -3,10 +3,10 @@ import requests
 from django.conf import settings
 
 ACTOR_ID                 = "ivanvs~craigslist-scraper"
-POLL_INTERVAL            = 5   
-COOLDOWN_BETWEEN_RUNS    = 20  
-COOLDOWN_POLL_INTERVAL   = 1   
-MAX_CITIES_PER_RUN       = 3   
+POLL_INTERVAL            = 5
+COOLDOWN_BETWEEN_RUNS    = 20
+COOLDOWN_POLL_INTERVAL   = 1
+MAX_CITIES_PER_RUN       = 3
 
 
 def chunk_list(lst, size):
@@ -19,7 +19,6 @@ def _apify_headers():
 
 
 def _abort_apify_run(run_id: str):
-    """Best-effort abort of a single Apify actor run."""
     try:
         requests.post(
             f"https://api.apify.com/v2/actor-runs/{run_id}/abort",
@@ -31,7 +30,6 @@ def _abort_apify_run(run_id: str):
 
 
 def _register_apify_run(scrape_run_id: int | None, apify_run_id: str):
-
     if not scrape_run_id:
         return
     try:
@@ -54,6 +52,20 @@ def _is_cancel_requested(scrape_run_id: int | None) -> bool:
         return ScrapeRun.objects.filter(pk=scrape_run_id, cancel_requested=True).exists()
     except Exception:
         return False
+
+
+def _fetch_dataset_count(dataset_id: str) -> int:
+    """Poll Apify dataset metadata for current item count — no download needed."""
+    try:
+        resp = requests.get(
+            f"https://api.apify.com/v2/datasets/{dataset_id}",
+            headers=_apify_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", {}).get("itemCount", 0)
+    except Exception:
+        return 0
 
 
 def build_craigslist_payload(cities: list[str], category_codes: list[str]) -> dict:
@@ -79,7 +91,6 @@ def _launch_and_guard(
     category_codes: list[str],
     scrape_run_id: int | None,
 ) -> tuple[str, str] | None:
-
     resp = requests.post(
         f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs",
         json=build_craigslist_payload(cities, category_codes),
@@ -90,11 +101,8 @@ def _launch_and_guard(
     run_id     = data["id"]
     dataset_id = data["defaultDatasetId"]
 
-    # Register FIRST — before the post-launch cancel check — so that
-    # cancel_scrape's own sweep also sees this ID.
     _register_apify_run(scrape_run_id, run_id)
 
-    # Post-launch cancel guard
     if _is_cancel_requested(scrape_run_id):
         _abort_apify_run(run_id)
         return None
@@ -104,25 +112,41 @@ def _launch_and_guard(
 
 def wait_for_run(
     run_id: str,
+    dataset_id: str = None,
     source_label: str = "Craigslist",
     scrape_run_id: int | None = None,
     log_fn=None,
+    progress_callback=None,
 ):
+    """
+    Poll actor status until terminal.
+    Every 2 polls (~10s) also checks the live dataset item count and
+    fires progress_callback(count) so the pipeline can update stage_detail.
+    """
+    log        = log_fn or print
+    url        = f"https://api.apify.com/v2/actor-runs/{run_id}"
+    poll_count = 0
 
-    log = log_fn or print
-    url = f"https://api.apify.com/v2/actor-runs/{run_id}"
     while True:
         res = requests.get(url, headers=_apify_headers())
         res.raise_for_status()
         status = res.json()["data"]["status"]
-        log(f"[{source_label}] Actor status: {status}")
+        poll_count += 1
+
+        # Live item count every 2 polls (~10s)
+        if dataset_id and poll_count % 2 == 0:
+            count = _fetch_dataset_count(dataset_id)
+            if progress_callback and count > 0:
+                progress_callback(count)
+            log(f"[{source_label}] Status: {status} | ~{count} item(s) in Apify dataset so far")
+        else:
+            log(f"[{source_label}] Actor status: {status}")
 
         if status == "SUCCEEDED":
             return
         if status in ["FAILED", "ABORTED", "TIMED-OUT"]:
             raise Exception(f"[{source_label}] Actor run {run_id} ended with: {status}")
 
-        # Cancel check inside the poll loop — abort the live actor instantly
         if _is_cancel_requested(scrape_run_id):
             _abort_apify_run(run_id)
             raise Exception(f"[{source_label}] Cancelled by user")
@@ -145,7 +169,6 @@ def _interruptible_cooldown(
     scrape_run_id: int | None,
     log_fn=None,
 ) -> bool:
-
     log     = log_fn or print
     elapsed = 0
     while elapsed < seconds:
@@ -163,14 +186,18 @@ def scrape_craigslist_progressive(
     category_codes: list[str],
     scrape_run_id: int | None = None,
     _log_fn=None,
+    progress_callback=None,
 ):
-
+    """
+    Generator — yields one list[dict] of raw results per city batch.
+    progress_callback(apify_item_count) is fired every ~10s while
+    the Apify actor is running so the caller can surface live counts.
+    """
     log     = _log_fn or print
     batches = list(chunk_list(cities, MAX_CITIES_PER_RUN))
 
     for i, batch in enumerate(batches):
 
-        # 1. Pre-launch check
         if _is_cancel_requested(scrape_run_id):
             log(f"[Craigslist] Cancel requested — stopping before batch {i+1}")
             return
@@ -180,7 +207,6 @@ def scrape_craigslist_progressive(
             f"{batch} | categories: {category_codes}"
         )
 
-        # 2. Launch with post-launch guard
         result = _launch_and_guard(batch, category_codes, scrape_run_id)
         if result is None:
             log("[Craigslist] Cancelled during actor launch — stopping.")
@@ -188,9 +214,15 @@ def scrape_craigslist_progressive(
         run_id, dataset_id = result
         log(f"[Craigslist] Actor started (run {run_id})")
 
-        # 3. Poll — actor is aborted the moment cancel is detected
         try:
-            wait_for_run(run_id, scrape_run_id=scrape_run_id, log_fn=log)
+            wait_for_run(
+                run_id,
+                dataset_id=dataset_id,
+                source_label="Craigslist",
+                scrape_run_id=scrape_run_id,
+                log_fn=log,
+                progress_callback=progress_callback,
+            )
         except Exception as e:
             log(f"[Craigslist] Run ended: {e}")
             try:
@@ -200,13 +232,12 @@ def scrape_craigslist_progressive(
                     yield partial
             except Exception as fetch_err:
                 log(f"[Craigslist] Could not fetch partial dataset: {fetch_err}")
-            return  # stop regardless — cancelled or hard failure
+            return
 
         results = fetch_dataset(dataset_id)
         log(f"[Craigslist] Got {len(results)} results from batch {i+1}")
         yield results
 
-        # 4. Interruptible cooldown before the next batch
         if i < len(batches) - 1:
             log(
                 f"[Craigslist] Cooling down {COOLDOWN_BETWEEN_RUNS}s "
@@ -215,4 +246,4 @@ def scrape_craigslist_progressive(
             if not _interruptible_cooldown(
                 COOLDOWN_BETWEEN_RUNS, scrape_run_id, log_fn=log
             ):
-                return  # cancelled during cooldown
+                return

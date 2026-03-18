@@ -3,32 +3,19 @@ fb_service.py  —  Facebook post scraping (manual groups only)
 
 Phase A (group discovery via keyword search) has been removed.
 All group URLs are provided manually by the user.
-
-Design notes
-────────────
-• Posts are scraped from user-supplied group URLs only.
-• ScrapedFbPost dedup prevents re-storing posts across runs.
-• Results are yielded batch-by-batch so pipeline.py can save
-  leads immediately — even if the run is aborted mid-way.
-• Cancel is checked before every batch and during polling,
-  so Stop always works quickly.
 """
 
 import time
 import requests
 from django.conf import settings
 
-# ── Actor ID ──────────────────────────────────────────────────
 FB_POSTS_ACTOR_ID = "apify~facebook-groups-scraper"
 
-# ── Tuning constants ──────────────────────────────────────────
-POLL_INTERVAL            = 5    # seconds between status checks
-GROUPS_PER_POST_BATCH    = 5    # group URLs sent to post actor per run
-MAX_POSTS_PER_GROUP      = 50   # default posts-per-group cap
-COOLDOWN_BETWEEN_BATCHES = 10   # seconds between post-scrape batches
+POLL_INTERVAL            = 5
+GROUPS_PER_POST_BATCH    = 5
+MAX_POSTS_PER_GROUP      = 50
+COOLDOWN_BETWEEN_BATCHES = 10
 
-
-# ── Apify helpers ─────────────────────────────────────────────
 
 def _apify_headers() -> dict:
     return {"Authorization": f"Bearer {settings.APIFY_TOKEN}"}
@@ -72,15 +59,25 @@ def _is_cancel_requested(scrape_run_id) -> bool:
         return False
 
 
+def _fetch_dataset_count(dataset_id: str) -> int:
+    """Poll Apify dataset metadata for current item count — no download needed."""
+    try:
+        resp = requests.get(
+            f"https://api.apify.com/v2/datasets/{dataset_id}",
+            headers=_apify_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", {}).get("itemCount", 0)
+    except Exception:
+        return 0
+
+
 def _launch_actor(
     actor_id: str,
     payload: dict,
     scrape_run_id,
 ) -> tuple[str, str] | None:
-    """
-    Launch an Apify actor, register the run ID, and perform a
-    post-launch cancel check.  Returns (run_id, dataset_id) or None.
-    """
     resp = requests.post(
         f"https://api.apify.com/v2/acts/{actor_id}/runs",
         json=payload,
@@ -102,13 +99,17 @@ def _launch_actor(
 
 def _poll_until_done(
     run_id: str,
-    label: str,
-    scrape_run_id,
-    log,
+    dataset_id: str = None,
+    label: str = "Facebook Posts",
+    scrape_run_id=None,
+    log=None,
+    progress_callback=None,
 ) -> str:
     """
-    Poll actor status until terminal.  Aborts if cancel is requested.
-    Returns the final status string ("SUCCEEDED", "FAILED", etc.)
+    Poll actor status until terminal.
+    Every 2 polls (~10s) also checks the live dataset item count and
+    fires progress_callback(count) so the pipeline can update stage_detail.
+    Returns the final status string.
     """
     poll_count = 0
     while True:
@@ -130,15 +131,24 @@ def _poll_until_done(
             time.sleep(POLL_INTERVAL)
             continue
 
+        poll_count += 1
+
+        # Live item count every 2 polls (~10s)
+        if dataset_id and poll_count % 2 == 0:
+            count = _fetch_dataset_count(dataset_id)
+            if progress_callback and count > 0:
+                progress_callback(count)
+            if poll_count % 4 == 0:
+                log(f"[{label}] Still running ({poll_count * POLL_INTERVAL}s) | ~{count} post(s) found so far…")
+        elif poll_count % 4 == 0:
+            log(f"[{label}] Still running ({poll_count * POLL_INTERVAL}s)…")
+
         if status == "SUCCEEDED":
             return "SUCCEEDED"
         if status in ("FAILED", "ABORTED", "TIMED-OUT"):
             log(f"[{label}] Actor run {run_id} ended with: {status}")
             return status
 
-        poll_count += 1
-        if poll_count % 4 == 0:
-            log(f"[{label}] Still running ({poll_count * POLL_INTERVAL}s)…")
         time.sleep(POLL_INTERVAL)
 
 
@@ -153,13 +163,7 @@ def _fetch_dataset(dataset_id: str, limit: int = 1000) -> list[dict]:
     return resp.json()
 
 
-# ── Upsert group registry ─────────────────────────────────────
-
 def upsert_fb_groups(group_urls: list[str], log=None) -> None:
-    """
-    Ensure every URL in group_urls has a ScrapedFbGroup record.
-    Creates rows for new groups (name resolved later from post data).
-    """
     log = log or print
     try:
         from base.models import ScrapedFbGroup
@@ -174,8 +178,6 @@ def upsert_fb_groups(group_urls: list[str], log=None) -> None:
     except Exception as e:
         log(f"[Facebook] Could not upsert group registry: {e}")
 
-
-# ── Post scraping ─────────────────────────────────────────────
 
 def build_fb_posts_payload(
     group_urls: list[str],
@@ -198,14 +200,12 @@ def scrape_fb_groups_progressive(
     max_posts_per_group: int = MAX_POSTS_PER_GROUP,
     scrape_run_id=None,
     log=None,
+    progress_callback=None,
 ):
     """
-    Generator.  Yields one list[dict] of raw post items per batch of groups.
-
-    • Results are yielded after EVERY batch so pipeline.py can save them
-      immediately — no data is lost on abort/failure.
-    • Even a FAILED or ABORTED run yields whatever was collected before
-      the failure so partial results are always persisted.
+    Generator — yields one list[dict] of raw post items per batch of groups.
+    progress_callback(apify_item_count) is fired every ~10s while the
+    Apify actor is running so the caller can surface live counts.
     """
     log = log or print
 
@@ -213,7 +213,6 @@ def scrape_fb_groups_progressive(
         log("[Facebook Posts] No group URLs to scrape")
         return
 
-    # Ensure all groups exist in the registry before scraping
     upsert_fb_groups(group_urls, log=log)
 
     batches = [
@@ -247,7 +246,6 @@ def scrape_fb_groups_progressive(
             result = _launch_actor(FB_POSTS_ACTOR_ID, payload, scrape_run_id)
         except Exception as e:
             log(f"[Facebook Posts] Failed to launch batch {b_idx + 1}: {e}")
-            # Don't stop — try the next batch
             continue
 
         if result is None:
@@ -260,9 +258,15 @@ def scrape_fb_groups_progressive(
             f"(run {run_id}) — waiting for posts…"
         )
 
-        status = _poll_until_done(run_id, "Facebook Posts", scrape_run_id, log)
+        status = _poll_until_done(
+            run_id,
+            dataset_id=dataset_id,
+            label="Facebook Posts",
+            scrape_run_id=scrape_run_id,
+            log=log,
+            progress_callback=progress_callback,
+        )
 
-        # ── Always fetch whatever was collected, even on partial runs ──
         items = []
         try:
             items = _fetch_dataset(
@@ -275,9 +279,7 @@ def scrape_fb_groups_progressive(
                 f"batch {b_idx + 1}: {e}"
             )
             if status == "ABORTED":
-                # Nothing to save — stop
                 return
-            # For other errors, continue to next batch
             continue
 
         log(
@@ -285,18 +287,14 @@ def scrape_fb_groups_progressive(
             f"{len(items)} post(s) retrieved"
         )
 
-        # Update group name + post_count from scraped data
         _update_group_metadata(batch, items, log)
 
-        # Yield immediately so pipeline saves before moving on
         if items:
             yield items
 
         if status == "ABORTED":
-            # Cancelled mid-run — partial items already yielded above
             return
 
-        # Cooldown between batches (cancel-aware)
         if b_idx < total_batches - 1:
             log(
                 f"[Facebook Posts] Cooling down {COOLDOWN_BETWEEN_BATCHES}s "
@@ -310,10 +308,6 @@ def scrape_fb_groups_progressive(
 
 
 def _update_group_metadata(batch_urls: list[str], items: list[dict], log):
-    """
-    Update ScrapedFbGroup with group name (if discovered from posts)
-    and increment post_count for each group in this batch.
-    """
     try:
         from base.models import ScrapedFbGroup
         from django.db.models import F
@@ -331,7 +325,6 @@ def _update_group_metadata(batch_urls: list[str], items: list[dict], log):
                 continue
             url_counts[g_url] = url_counts.get(g_url, 0) + 1
 
-            # Try to harvest group name from post data
             g_name = (
                 item.get("groupName")
                 or item.get("group")
@@ -342,7 +335,7 @@ def _update_group_metadata(batch_urls: list[str], items: list[dict], log):
                 url_names[g_url] = g_name
 
         for raw_url in batch_urls:
-            norm = raw_url.rstrip("/") + "/"
+            norm  = raw_url.rstrip("/") + "/"
             count = url_counts.get(norm, 0)
             name  = url_names.get(norm, "")
 
@@ -350,7 +343,6 @@ def _update_group_metadata(batch_urls: list[str], items: list[dict], log):
             if count:
                 update_kwargs["post_count"] = F("post_count") + count
             if name:
-                # Only set name if the stored name is blank
                 grp = ScrapedFbGroup.objects.filter(
                     group_url__in=[raw_url, norm]
                 ).first()

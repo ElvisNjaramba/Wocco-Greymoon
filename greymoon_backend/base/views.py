@@ -1,12 +1,20 @@
 # ============================================================
-#  views.py  —  manual-groups-only Facebook integration
+# views.py  —  full updated file
+# Changes vs previous version:
+#   • list_services: added date_from / date_to filters on created_at
+#   • export_leads:  same date_from / date_to filters + all prior filters
 # ============================================================
 
 import re
+import io
 import uuid
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from django.conf import settings
+from django.http import HttpResponse
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -37,6 +45,85 @@ _STATE_NAME_TO_ABBREV = {
 }
 
 
+# ── Shared: apply all filters to a queryset ───────────────────
+
+def _apply_lead_filters(leads, params):
+    """
+    Apply every supported filter to a ServiceLead queryset.
+    params is request.query_params (or any dict-like).
+    Returns the filtered queryset.
+    """
+    source = params.get("source")
+    if source:
+        leads = leads.filter(source=source.upper())
+
+    service_category = params.get("service_category")
+    if service_category:
+        leads = leads.filter(service_category=service_category.lower())
+
+    status = params.get("status")
+    if status:
+        leads = leads.filter(status=status.upper())
+
+    min_score = params.get("min_score")
+    if min_score:
+        try:
+            leads = leads.filter(score__gte=int(min_score))
+        except ValueError:
+            pass
+
+    search = params.get("search")
+    if search:
+        from django.db.models import Q
+        leads = leads.filter(
+            Q(location__icontains=search) | Q(title__icontains=search)
+        )
+
+    if params.get("has_phone") in ("true", "1"):
+        leads = leads.exclude(phone__isnull=True).exclude(phone="")
+    if params.get("has_email") in ("true", "1"):
+        leads = leads.exclude(email__isnull=True).exclude(email="")
+
+    fb_group = params.get("fb_group")
+    if fb_group:
+        leads = leads.filter(fb_group_name__icontains=fb_group)
+
+    # date_after is used internally by the live-polling mechanism
+    date_after = params.get("date_after")
+    if date_after:
+        try:
+            from django.utils.dateparse import parse_datetime
+            dt = parse_datetime(date_after)
+            if dt:
+                leads = leads.filter(created_at__gte=dt)
+        except Exception:
+            pass
+
+    # date_from / date_to — user-facing date range filter on created_at
+    # Accepts YYYY-MM-DD format from the date picker
+    date_from = params.get("date_from")
+    if date_from:
+        try:
+            from django.utils.dateparse import parse_date
+            d = parse_date(date_from)
+            if d:
+                leads = leads.filter(created_at__date__gte=d)
+        except Exception:
+            pass
+
+    date_to = params.get("date_to")
+    if date_to:
+        try:
+            from django.utils.dateparse import parse_date
+            d = parse_date(date_to)
+            if d:
+                leads = leads.filter(created_at__date__lte=d)
+        except Exception:
+            pass
+
+    return leads
+
+
 # ── Scrape: Start ─────────────────────────────────────────────
 
 @api_view(["POST"])
@@ -53,7 +140,6 @@ def manual_scrape(request):
             status=400,
         )
 
-    # ── Location (optional for FB-only runs) ──────────────────
     location = data.get("location") or {}
     location_type  = location.get("type", "").lower() if location else ""
     location_value = (location.get("value") or "").strip() if location else ""
@@ -61,7 +147,6 @@ def manual_scrape(request):
     if location_type and location_type not in ("state", "city", "zip"):
         return Response({"error": "location.type must be 'state', 'city', or 'zip'."}, status=400)
 
-    # ── Facebook group URLs ───────────────────────────────────
     fb_group_urls_raw = data.get("fb_group_urls") or []
     if isinstance(fb_group_urls_raw, str):
         fb_group_urls_raw = [u.strip() for u in fb_group_urls_raw.split(",") if u.strip()]
@@ -69,14 +154,12 @@ def manual_scrape(request):
 
     fb_only = set(sources) == {"facebook"}
 
-    # Validation
     if not location_value and not fb_group_urls:
         return Response({"error": "Provide a location or at least one Facebook group URL."}, status=400)
     if not location_value and "craigslist" in sources:
         return Response({"error": "location.value is required when scraping Craigslist."}, status=400)
 
     categories = data.get("categories", [])
-    # Categories are only required when scraping non-Facebook sources
     non_fb_sources = [s for s in sources if s != "facebook"]
     if non_fb_sources and not categories:
         return Response(
@@ -92,16 +175,13 @@ def manual_scrape(request):
                 status=400,
             )
 
-    # Posts per group limit
     max_posts_per_group = int(data.get("max_posts_per_group", 50))
     max_posts_per_group = max(5, min(max_posts_per_group, 500))
 
-    # Google settings
     google_max_pages   = int(data.get("google_max_pages", 3))
     google_max_pages   = max(1, min(google_max_pages, 10))
     google_deep_scrape = bool(data.get("google_deep_scrape", True))
 
-    # Resolve location
     if location_value:
         try:
             location_data = resolve_location(location_type, location_value)
@@ -256,6 +336,22 @@ def scrape_status(request):
     if not run:
         return Response({"status": "IDLE"})
 
+    source_stats = {}
+    try:
+        source_stats = run.source_stats or {}
+    except AttributeError:
+        pass
+
+    if not source_stats:
+        for entry in (run.activity_log or []):
+            if entry.get("type") == "source_stats":
+                src = entry.get("source")
+                if src:
+                    source_stats[src] = {
+                        "saved":   entry.get("saved", 0),
+                        "skipped": entry.get("skipped", 0),
+                    }
+
     return Response({
         "run_id":          run.run_id,
         "status":          run.status,
@@ -264,6 +360,7 @@ def scrape_status(request):
         "sources":         run.sources,
         "leads_collected": run.leads_collected,
         "leads_skipped":   run.leads_skipped,
+        "source_stats":    source_stats,
         "current_stage":   run.current_stage or "",
         "stage_detail":    run.stage_detail or "",
         "activity_log":    run.activity_log or [],
@@ -294,15 +391,11 @@ def scrape_history(request):
     ])
 
 
-# ── FB Groups: Add groups (no scraping yet) ───────────────────
+# ── FB Groups: Add groups ─────────────────────────────────────
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def add_fb_groups(request):
-    """
-    Register one or more Facebook group URLs without scraping them.
-    The user can then trigger scraping from the Groups tab.
-    """
     urls_raw = request.data.get("group_urls") or []
     if isinstance(urls_raw, str):
         urls_raw = [u.strip() for u in re.split(r"[\n,]+", urls_raw) if u.strip()]
@@ -357,16 +450,11 @@ def list_scraped_groups(request):
     return Response({"groups": groups, "total": len(groups)})
 
 
-# ── FB Groups: Scrape selected groups ────────────────────────
+# ── FB Groups: Scrape selected ────────────────────────────────
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def scrape_selected_groups(request):
-    """
-    Trigger a Facebook-only scrape run for a specific set of group URLs.
-    No category or location required — Facebook scraping is fully independent.
-    max_posts_per_group can be specified per-request.
-    """
     group_urls = request.data.get("group_urls") or []
     if isinstance(group_urls, str):
         group_urls = [u.strip() for u in re.split(r"[\n,]+", group_urls) if u.strip()]
@@ -437,7 +525,7 @@ def list_group_leads(request):
     })
 
 
-# ── FB Groups: Delete a group ─────────────────────────────────
+# ── FB Groups: Delete ─────────────────────────────────────────
 
 @api_view(["DELETE"])
 @permission_classes([IsAuthenticated])
@@ -456,48 +544,8 @@ def delete_scraped_group(request):
 def list_services(request):
     leads = ServiceLead.objects.all()
 
-    source = request.query_params.get("source")
-    if source:
-        leads = leads.filter(source=source.upper())
-
-    service_category = request.query_params.get("service_category")
-    if service_category:
-        leads = leads.filter(service_category=service_category.lower())
-
-    status = request.query_params.get("status")
-    if status:
-        leads = leads.filter(status=status.upper())
-
-    min_score = request.query_params.get("min_score")
-    if min_score:
-        try:
-            leads = leads.filter(score__gte=int(min_score))
-        except ValueError:
-            pass
-
-    search = request.query_params.get("search")
-    if search:
-        leads = leads.filter(location__icontains=search) | \
-                leads.filter(title__icontains=search)
-
-    if request.query_params.get("has_phone") in ("true", "1"):
-        leads = leads.exclude(phone__isnull=True).exclude(phone="")
-    if request.query_params.get("has_email") in ("true", "1"):
-        leads = leads.exclude(email__isnull=True).exclude(email="")
-
-    fb_group = request.query_params.get("fb_group")
-    if fb_group:
-        leads = leads.filter(fb_group_name__icontains=fb_group)
-
-    date_after = request.query_params.get("date_after")
-    if date_after:
-        try:
-            from django.utils.dateparse import parse_datetime
-            dt = parse_datetime(date_after)
-            if dt:
-                leads = leads.filter(created_at__gte=dt)
-        except Exception:
-            pass
+    # Apply all shared filters (including date_from / date_to)
+    leads = _apply_lead_filters(leads, request.query_params)
 
     ordering_param = request.query_params.get("ordering", "-created_at")
     ALLOWED_ORDERING_FIELDS = {
@@ -561,6 +609,209 @@ def update_lead_status(request, post_id):
     lead.status = new_status
     lead.save()
     return Response({"message": "Status updated", "status": new_status})
+
+
+# ── Leads: Export to Excel ────────────────────────────────────
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def export_leads(request):
+    """
+    Export filtered leads to a formatted Excel file.
+    Accepts all the same filter params as list_services including
+    date_from / date_to so exports always match what's on screen.
+    """
+    leads = ServiceLead.objects.all()
+
+    # Apply all shared filters
+    leads = _apply_lead_filters(leads, request.query_params)
+    leads = leads.order_by("-score", "-created_at")
+
+    # ── Build workbook ────────────────────────────────────────
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Leads"
+
+    HEADER_BG  = "1E293B"
+    HEADER_FG  = "F8FAFC"
+    CL_BG      = "FFF7ED"
+    FB_BG      = "EEF2FF"
+    GG_BG      = "F0F9FF"
+    ALT_BG     = "F8FAFC"
+    HIGH_SCORE = "D1FAE5"
+    MED_SCORE  = "FEF9C3"
+    BORDER_CLR = "E2E8F0"
+
+    SOURCE_BG = {
+        "CRAIGSLIST": CL_BG,
+        "FACEBOOK":   FB_BG,
+        "GOOGLE":     GG_BG,
+    }
+    SOURCE_LABEL = {
+        "CRAIGSLIST": "CL",
+        "FACEBOOK":   "FB",
+        "GOOGLE":     "GG",
+    }
+
+    def thin_border():
+        s = Side(style="thin", color=BORDER_CLR)
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    def header_font():
+        return Font(name="Arial", bold=True, color=HEADER_FG, size=9)
+
+    def cell_font(bold=False, color="1E293B", size=9):
+        return Font(name="Arial", bold=bold, color=color, size=size)
+
+    def fill(hex_color):
+        return PatternFill("solid", fgColor=hex_color)
+
+    def center():
+        return Alignment(horizontal="center", vertical="center", wrap_text=False)
+
+    def left():
+        return Alignment(horizontal="left", vertical="center", wrap_text=False)
+
+    COLS = [
+        ("Source",       "source",           8,   "center"),
+        ("Score",        "score",            7,   "center"),
+        ("Status",       "status",           11,  "center"),
+        ("Title",        "title",            42,  "left"),
+        ("Phone",        "phone",            16,  "left"),
+        ("Email",        "email",            28,  "left"),
+        ("Location",     "location",         20,  "left"),
+        ("State",        "state",            8,   "center"),
+        ("Category",     "service_category", 18,  "left"),
+        ("FB Group",     "fb_group_name",    24,  "left"),
+        ("URL",          "url",              40,  "left"),
+        ("Posted",       "datetime",         14,  "center"),
+        ("Scraped",      "created_at",       14,  "center"),
+    ]
+
+    ws.row_dimensions[1].height = 20
+    for col_idx, (header, _, width, align) in enumerate(COLS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font      = header_font()
+        cell.fill      = fill(HEADER_BG)
+        cell.alignment = center() if align == "center" else left()
+        cell.border    = thin_border()
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    ws.freeze_panes = "A2"
+
+    for row_idx, lead in enumerate(leads, start=2):
+        ws.row_dimensions[row_idx].height = 16
+        src    = (lead.source or "").upper()
+        row_bg = SOURCE_BG.get(src, ALT_BG if row_idx % 2 == 0 else "FFFFFF")
+
+        for col_idx, (_, field, _, align) in enumerate(COLS, start=1):
+            if field == "source":
+                value = SOURCE_LABEL.get(src, src)
+            elif field == "score":
+                value = lead.score
+            elif field == "status":
+                value = lead.status
+            elif field == "title":
+                value = (lead.title or "")[:200]
+            elif field == "phone":
+                value = lead.phone or ""
+            elif field == "email":
+                value = lead.email or ""
+            elif field == "location":
+                value = lead.location or ""
+            elif field == "state":
+                value = lead.state or ""
+            elif field == "service_category":
+                value = lead.service_category or lead.category or ""
+            elif field == "fb_group_name":
+                value = lead.fb_group_name or ""
+            elif field == "url":
+                value = lead.url or ""
+            elif field == "datetime":
+                value = lead.datetime.strftime("%Y-%m-%d") if lead.datetime else ""
+            elif field == "created_at":
+                value = lead.created_at.strftime("%Y-%m-%d") if lead.created_at else ""
+            else:
+                value = ""
+
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.border    = thin_border()
+            cell.alignment = center() if align == "center" else left()
+
+            if field == "score":
+                score_val = lead.score or 0
+                if score_val >= 70:
+                    cell.fill = fill(HIGH_SCORE)
+                    cell.font = cell_font(bold=True, color="065F46")
+                elif score_val >= 40:
+                    cell.fill = fill(MED_SCORE)
+                    cell.font = cell_font(bold=True, color="92400E")
+                else:
+                    cell.fill = fill(row_bg)
+                    cell.font = cell_font(color="64748B")
+            elif field == "phone" and lead.phone:
+                cell.fill = fill(row_bg)
+                cell.font = cell_font(bold=True, color="065F46")
+            elif field == "email" and lead.email:
+                cell.fill = fill(row_bg)
+                cell.font = cell_font(bold=True, color="4338CA")
+            elif field == "url" and lead.url:
+                cell.fill      = fill(row_bg)
+                cell.font      = Font(name="Arial", size=9, color="2563EB", underline="single")
+                cell.hyperlink = lead.url
+            else:
+                cell.fill = fill(row_bg)
+                cell.font = cell_font(
+                    bold=(field == "title"),
+                    color="1E293B" if field == "title" else "475569",
+                )
+
+    # Summary rows
+    total_rows  = leads.count()
+    summary_row = total_rows + 3
+    ws.cell(row=summary_row,     column=1, value="Total leads exported:").font = cell_font(bold=True)
+    ws.cell(row=summary_row,     column=2, value=total_rows).font              = cell_font(bold=True)
+    ws.cell(row=summary_row + 1, column=1, value="Exported at:").font          = cell_font(bold=True)
+    from django.utils import timezone as tz
+    ws.cell(row=summary_row + 1, column=2,
+            value=tz.now().strftime("%Y-%m-%d %H:%M UTC")).font = cell_font()
+
+    # Active filters summary so user knows what they exported
+    filters_applied = []
+    if request.query_params.get("source"):
+        filters_applied.append(f"Source: {request.query_params['source']}")
+    if request.query_params.get("date_from"):
+        filters_applied.append(f"From: {request.query_params['date_from']}")
+    if request.query_params.get("date_to"):
+        filters_applied.append(f"To: {request.query_params['date_to']}")
+    if request.query_params.get("status"):
+        filters_applied.append(f"Status: {request.query_params['status']}")
+    if request.query_params.get("min_score"):
+        filters_applied.append(f"Min score: {request.query_params['min_score']}")
+    if request.query_params.get("has_phone") in ("true", "1"):
+        filters_applied.append("Has phone")
+    if request.query_params.get("has_email") in ("true", "1"):
+        filters_applied.append("Has email")
+    if filters_applied:
+        ws.cell(row=summary_row + 2, column=1, value="Filters:").font = cell_font(bold=True)
+        ws.cell(row=summary_row + 2, column=2,
+                value=" | ".join(filters_applied)).font = cell_font(color="475569")
+
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(COLS))}1"
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    from django.utils import timezone as tz2
+    filename = f"leads_export_{tz2.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+    response = HttpResponse(
+        buffer.read(),
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
 
 
 # ── Meta: Cities ──────────────────────────────────────────────

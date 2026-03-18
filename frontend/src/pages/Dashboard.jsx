@@ -7,7 +7,7 @@ import {
   Globe, Search, TrendingUp, Clock, Loader, Target,
   Users, MessageSquare, ThumbsUp, Share2, ExternalLink,
   CheckCircle, AlertTriangle, AlertCircle, Info, ChevronDown, ChevronUp,
-  Menu, LayoutGrid, List, Plus, Play, Trash2,
+  Menu, LayoutGrid, List, Plus, Play, Trash2, Download,
 } from "lucide-react";
 
 const API = "http://127.0.0.1:8000/api";
@@ -111,10 +111,124 @@ function sourceFamily(src) {
 }
 
 const SOURCE_CFG = {
-  CRAIGSLIST: { label: "CL",  badge: "bg-orange-500/10 text-orange-400 border-orange-500/20", pill: "bg-orange-500/15 border-orange-500/40 text-orange-300", pillIdle: "bg-orange-500/8 border-orange-500/20 text-orange-400/60", hero: "border-orange-500/30 bg-gradient-to-br from-orange-950/30 to-[#0f1117]", line: "bg-gradient-to-r from-transparent via-orange-400/80 to-transparent animate-pulse", nav: "bg-orange-500/10 border-orange-500/25 text-orange-400", icon: Globe,  mapColor: "text-orange-600", emoji: "🔶", name: "Craigslist" },
-  FACEBOOK:   { label: "FB",  badge: "bg-indigo-500/10 text-indigo-400 border-indigo-500/20", pill: "bg-indigo-500/15 border-indigo-500/40 text-indigo-300", pillIdle: "bg-indigo-500/8 border-indigo-500/20 text-indigo-400/60", hero: "border-indigo-500/30 bg-gradient-to-br from-indigo-950/30 to-[#0f1117]", line: "bg-gradient-to-r from-transparent via-indigo-400/80 to-transparent animate-pulse", nav: "bg-indigo-500/10 border-indigo-500/25 text-indigo-400", icon: Users,  mapColor: "text-indigo-600", emoji: "🔷", name: "Facebook Groups" },
-  GOOGLE:     { label: "GG",  badge: "bg-sky-500/10 text-sky-400 border-sky-500/20",           pill: "bg-sky-500/15 border-sky-500/40 text-sky-300",           pillIdle: "bg-sky-500/8 border-sky-500/20 text-sky-400/60",           hero: "border-sky-500/30 bg-gradient-to-br from-sky-950/30 to-[#0f1117]",         line: "bg-gradient-to-r from-transparent via-sky-400/80 to-transparent animate-pulse",     nav: "bg-sky-500/10 border-sky-500/25 text-sky-400",         icon: Search, mapColor: "text-sky-600",     emoji: "🔍", name: "Google Search" },
+  CRAIGSLIST: { label: "CL",  badge: "bg-orange-500/10 text-orange-400 border-orange-500/20", pill: "bg-orange-500/15 border-orange-500/40 text-orange-300", pillIdle: "bg-orange-500/8 border-orange-500/20 text-orange-400/60", hero: "border-orange-500/30 bg-gradient-to-br from-orange-950/30 to-[#0f1117]", line: "bg-gradient-to-r from-transparent via-orange-400/80 to-transparent animate-pulse", nav: "bg-orange-500/10 border-orange-500/25 text-orange-400", icon: Globe,  mapColor: "text-orange-600", emoji: "🔶", name: "Craigslist",      counterColor: "text-orange-400", counterBg: "bg-orange-500/10 border-orange-500/20" },
+  FACEBOOK:   { label: "FB",  badge: "bg-indigo-500/10 text-indigo-400 border-indigo-500/20", pill: "bg-indigo-500/15 border-indigo-500/40 text-indigo-300", pillIdle: "bg-indigo-500/8 border-indigo-500/20 text-indigo-400/60", hero: "border-indigo-500/30 bg-gradient-to-br from-indigo-950/30 to-[#0f1117]", line: "bg-gradient-to-r from-transparent via-indigo-400/80 to-transparent animate-pulse", nav: "bg-indigo-500/10 border-indigo-500/25 text-indigo-400", icon: Users,  mapColor: "text-indigo-600", emoji: "🔷", name: "Facebook Groups",  counterColor: "text-indigo-400", counterBg: "bg-indigo-500/10 border-indigo-500/20" },
+  GOOGLE:     { label: "GG",  badge: "bg-sky-500/10 text-sky-400 border-sky-500/20",           pill: "bg-sky-500/15 border-sky-500/40 text-sky-300",           pillIdle: "bg-sky-500/8 border-sky-500/20 text-sky-400/60",           hero: "border-sky-500/30 bg-gradient-to-br from-sky-950/30 to-[#0f1117]",         line: "bg-gradient-to-r from-transparent via-sky-400/80 to-transparent animate-pulse",     nav: "bg-sky-500/10 border-sky-500/25 text-sky-400",         icon: Search, mapColor: "text-sky-600",     emoji: "🔍", name: "Google Search",     counterColor: "text-sky-400",    counterBg: "bg-sky-500/10 border-sky-500/20" },
 };
+
+// ── Parse source_stats from activity_log (fallback) ───────────
+function parseSourceStatsFromLog(activityLog) {
+  const stats = {};
+  for (const entry of (activityLog || [])) {
+    if (entry.type === "source_stats" && entry.source) {
+      stats[entry.source] = {
+        saved:   entry.saved   || 0,
+        skipped: entry.skipped || 0,
+      };
+    }
+  }
+  return stats;
+}
+
+// ── Per-source live counter card ──────────────────────────────
+// Shows DB-saved count + live Apify dataset count while actor runs.
+// The Apify count is parsed from scrapeStatus.stage_detail which
+// pipeline.py writes as: "~47 result(s) found by Apify | 12 lead(s) saved to DB so far"
+function SourceCounter({ sourceKey, sourceStats, isActive, isDone, isQueued, scrapeStatus }) {
+  const cfg = SOURCE_CFG[sourceKey];
+  if (!cfg) return null;
+
+  const key     = sourceKey.toLowerCase();
+  const stats   = sourceStats?.[key] || { saved: 0, skipped: 0 };
+  const saved   = stats.saved || 0;
+  const skipped = stats.skipped || 0;
+  const Icon    = cfg.icon;
+
+  // Parse live Apify item count from stage_detail for ALL sources, not just active.
+  // pipeline.py writes: "~47 result(s) found by Apify | 12 lead(s) saved to DB so far"
+  // We show this on the card of whichever source is currently running.
+  const apifyLiveCount = useMemo(() => {
+    if (isDone) return null;
+    if (!isActive) return null;
+    const detail = scrapeStatus?.stage_detail || "";
+    const match  = detail.match(/~(\d+)\s+result/i);
+    return match ? parseInt(match[1], 10) : null;
+  }, [isActive, isDone, scrapeStatus?.stage_detail]);
+
+  // The "hero" number: if Apify is returning results live, show that count big.
+  // Once leads are saved to DB, show those too.
+  const heroNumber  = apifyLiveCount !== null && apifyLiveCount > 0 ? apifyLiveCount : saved;
+  const heroIsApify = apifyLiveCount !== null && apifyLiveCount > 0;
+
+  const borderStyle =
+    isDone    ? "border-emerald-500/25 bg-emerald-500/5" :
+    isActive  ? `${cfg.counterBg}` :
+    isQueued  ? "border-white/[0.08] bg-white/[0.02]" :
+                "border-white/[0.05] bg-transparent opacity-40";
+
+  const numColor =
+    isDone        ? "text-emerald-400" :
+    heroIsApify   ? cfg.counterColor :
+    isActive      ? cfg.counterColor :
+                    "text-white/30";
+
+  return (
+    <div className={`flex-1 min-w-[90px] rounded-xl border px-3 py-2.5 transition-all duration-500 ${borderStyle}`}>
+      {/* Header row */}
+      <div className="flex items-center gap-1.5 mb-1.5">
+        {isDone ? (
+          <CheckCircle className="w-3 h-3 text-emerald-400 flex-shrink-0" />
+        ) : isActive ? (
+          <Loader className="w-3 h-3 animate-spin flex-shrink-0" />
+        ) : (
+          <Icon className="w-3 h-3 flex-shrink-0 text-white/25" />
+        )}
+        <span className={`text-[9px] font-bold uppercase tracking-widest ${isDone ? "text-emerald-400" : isActive ? cfg.counterColor : "text-white/25"}`}>
+          {cfg.label}
+        </span>
+        {isActive && !isDone && (
+          <span className="flex gap-0.5 ml-auto">
+            {[0, 150, 300].map(d => (
+              <span
+                key={d}
+                className={`w-1 h-1 rounded-full animate-bounce`}
+                style={{ animationDelay: `${d}ms`, backgroundColor: "currentColor" }}
+              />
+            ))}
+          </span>
+        )}
+        {isDone && <span className="ml-auto text-[9px] text-emerald-400/50">done</span>}
+      </div>
+
+      {/* Hero number — Apify live count takes priority, falls back to DB saved */}
+      <div className={`text-xl font-bold tabular-nums leading-none transition-all duration-300 ${numColor}`}>
+        {heroIsApify ? `~${heroNumber}` : heroNumber}
+      </div>
+
+      {/* Label under the big number */}
+      {heroIsApify ? (
+        <div className="text-[9px] mt-0.5 flex items-center gap-1" style={{ color: "currentColor", opacity: 0.5 }}>
+          <span className="w-1 h-1 rounded-full animate-pulse inline-block flex-shrink-0" style={{ backgroundColor: "currentColor" }} />
+          from Apify
+        </div>
+      ) : (
+        <div className="text-[9px] text-white/20 mt-0.5">leads saved</div>
+      )}
+
+      {/* Secondary row: if Apify count is shown as hero, also show how many are saved to DB */}
+      {heroIsApify && saved > 0 && (
+        <div className="mt-1.5 pt-1.5 border-t border-white/[0.06] flex items-center gap-1">
+          <span className={`text-xs font-bold tabular-nums ${cfg.counterColor}`}>{saved}</span>
+          <span className="text-[9px] text-white/25">saved</span>
+        </div>
+      )}
+
+      {skipped > 0 && (
+        <div className="text-[9px] text-white/20 mt-0.5 tabular-nums">{skipped} dupes</div>
+      )}
+    </div>
+  );
+}
 
 // ── UI atoms ──────────────────────────────────────────────────
 const Badge = ({ children, color = "slate" }) => {
@@ -197,7 +311,7 @@ function MapAutoFit({ leads }) {
 function ActivityPanel({ scrapeStatus, visible }) {
   const logRef = useRef(null);
   const [collapsed, setCollapsed] = useState(false);
-  const log = scrapeStatus?.activity_log || [];
+  const log = (scrapeStatus?.activity_log || []).filter(e => e.type !== "source_stats");
   const isRunning = scrapeStatus?.status === "RUNNING";
   useEffect(() => { if (logRef.current && !collapsed) logRef.current.scrollTop = logRef.current.scrollHeight; }, [log.length, collapsed]);
   if (!visible || isRunning) return null;
@@ -264,7 +378,7 @@ function SourcePill({ sourceKey, activeSrc, log }) {
 
 function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, newLeadsBuffer }) {
   const logRef = useRef(null);
-  const log          = scrapeStatus?.activity_log || [];
+  const log          = (scrapeStatus?.activity_log || []).filter(e => e.type !== "source_stats");
   const currentStage = scrapeStatus?.current_stage || "Initialising...";
   const stageDetail  = scrapeStatus?.stage_detail  || "";
   const serverSaved  = scrapeStatus?.leads_collected || 0;
@@ -273,6 +387,13 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
   const activeSrc    = stageSource(currentStage);
   const activeFamily = sourceFamily(activeSrc);
   const activeCfg    = SOURCE_CFG[activeFamily?.toUpperCase()];
+
+  const sourceStats = useMemo(() => {
+    if (scrapeStatus?.source_stats && Object.keys(scrapeStatus.source_stats).length > 0) {
+      return scrapeStatus.source_stats;
+    }
+    return parseSourceStatsFromLog(scrapeStatus?.activity_log);
+  }, [scrapeStatus?.source_stats, scrapeStatus?.activity_log]);
 
   const displayCount = Math.max(liveLeadCount ?? 0, serverSaved);
   useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [log.length]);
@@ -283,6 +404,10 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
 
   const heroBorder = isAborting ? "border-red-500/30 bg-gradient-to-br from-red-950/30 to-[#0f1117]" : activeCfg ? activeCfg.hero : "border-blue-500/20 bg-gradient-to-br from-slate-900/60 to-[#0f1117]";
   const heroLine   = isAborting ? "bg-red-500/50" : activeCfg ? activeCfg.line : "bg-gradient-to-r from-transparent via-blue-400/60 to-transparent animate-pulse";
+
+  const isDone    = (src) => log.some(e => e.stage?.toLowerCase().includes(`${src} — complete`) || e.stage?.toLowerCase().includes(`${src} — skipped`));
+  const isStarted = (src) => log.some(e => e.stage?.toLowerCase().includes(src));
+  const isActive  = (src) => activeSrc === src || (src === "facebook" && activeSrc === "facebook_posts");
 
   return (
     <div className="space-y-3">
@@ -321,6 +446,7 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
               </button>
             </div>
           </div>
+
           {sources.length > 0 && (
             <div className="flex gap-2 mb-4 flex-wrap">
               {sources.includes("craigslist") && <SourcePill sourceKey="CRAIGSLIST" activeSrc={activeSrc} log={log} />}
@@ -328,9 +454,46 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
               {sources.includes("google")     && <SourcePill sourceKey="GOOGLE"     activeSrc={activeSrc} log={log} />}
             </div>
           )}
+
+          {/* ── Per-source real-time counters ── */}
+          {sources.length > 0 && (
+            <div className="flex gap-2 mb-4 flex-wrap">
+              {sources.includes("craigslist") && (
+                <SourceCounter
+                  sourceKey="CRAIGSLIST"
+                  sourceStats={sourceStats}
+                  isActive={isActive("craigslist")}
+                  isDone={isDone("craigslist")}
+                  isQueued={isStarted("craigslist") || sources.includes("craigslist")}
+                  scrapeStatus={scrapeStatus}
+                />
+              )}
+              {sources.includes("facebook") && (
+                <SourceCounter
+                  sourceKey="FACEBOOK"
+                  sourceStats={sourceStats}
+                  isActive={isActive("facebook")}
+                  isDone={isDone("facebook")}
+                  isQueued={isStarted("facebook") || sources.includes("facebook")}
+                  scrapeStatus={scrapeStatus}
+                />
+              )}
+              {sources.includes("google") && (
+                <SourceCounter
+                  sourceKey="GOOGLE"
+                  sourceStats={sourceStats}
+                  isActive={isActive("google")}
+                  isDone={isDone("google")}
+                  isQueued={isStarted("google") || sources.includes("google")}
+                  scrapeStatus={scrapeStatus}
+                />
+              )}
+            </div>
+          )}
+
           <div className="grid grid-cols-3 gap-2">
             <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl px-3 py-2.5">
-              <div className="text-[9px] text-white/25 uppercase tracking-widest mb-1">Leads saved</div>
+              <div className="text-[9px] text-white/25 uppercase tracking-widest mb-1">Total saved</div>
               <div className="text-xl font-bold tabular-nums text-emerald-400">{displayCount}</div>
               {displayCount > 0 && <div className="text-[9px] text-emerald-400/40 mt-0.5 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />live</div>}
             </div>
@@ -530,7 +693,6 @@ const ALL_SOURCES = [
   { key: "google",     label: "Google",          emoji: "🔍" },
 ];
 
-// ── Helper: format city display name with state ───────────────
 function cityDisplayName(city) {
   if (!city) return "";
   if (city.state) return `${city.name}, ${city.state}`;
@@ -639,7 +801,6 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
 
   return (
     <div className="space-y-4">
-      {/* Add Groups */}
       <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
         <div className="px-4 py-3.5 border-b border-white/[0.06] flex items-center gap-2">
           <Plus className="w-4 h-4 text-indigo-400" />
@@ -669,7 +830,6 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
         </div>
       </div>
 
-      {/* Group list + scrape controls */}
       <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
         <div className="px-4 py-3.5 border-b border-white/[0.06] flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-2">
@@ -784,7 +944,6 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
         )}
       </div>
 
-      {/* Group drill-down */}
       {selectedGroup && (
         <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
           <div className="px-4 py-3.5 border-b border-white/[0.06] flex items-center justify-between gap-3">
@@ -832,49 +991,23 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
                   const likes    = lead.raw_json?.likesCount    || 0;
                   const comments = lead.raw_json?.commentsCount || 0;
                   return (
-                    <div
-                      key={lead.post_id}
-                      className="px-4 py-3.5 hover:bg-white/[0.02] transition-colors cursor-pointer group"
-                      onClick={() => setSelectedLead(lead)}
-                    >
+                    <div key={lead.post_id} className="px-4 py-3.5 hover:bg-white/[0.02] transition-colors cursor-pointer group" onClick={() => setSelectedLead(lead)}>
                       <div className="flex items-start gap-3 mb-2">
-                        <div className="w-7 h-7 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0 mt-0.5">
-                          {authorInitial}
-                        </div>
+                        <div className="w-7 h-7 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0 mt-0.5">{authorInitial}</div>
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-2 flex-wrap">
                             {authorName && <span className="text-xs font-semibold text-white/75 truncate max-w-[160px]">{authorName}</span>}
                             {postDate && <span className="text-[10px] text-white/25 font-mono">{postDate}</span>}
-                            <div className="ml-auto flex items-center gap-2 flex-shrink-0">
-                              <ScoreDot score={lead.score} />
-                            </div>
+                            <div className="ml-auto flex items-center gap-2 flex-shrink-0"><ScoreDot score={lead.score} /></div>
                           </div>
                         </div>
-                        <div onClick={e => e.stopPropagation()} className="flex-shrink-0">
-                          <StatusSelect value={lead.status} onChange={v => updateLeadStatus(lead.post_id, v)} />
-                        </div>
+                        <div onClick={e => e.stopPropagation()} className="flex-shrink-0"><StatusSelect value={lead.status} onChange={v => updateLeadStatus(lead.post_id, v)} /></div>
                       </div>
-
-                      {snippet && (
-                        <p className="text-xs text-white/50 leading-relaxed mb-2.5 whitespace-pre-wrap ml-10">{snippet}</p>
-                      )}
-
+                      {snippet && <p className="text-xs text-white/50 leading-relaxed mb-2.5 whitespace-pre-wrap ml-10">{snippet}</p>}
                       <div className="flex items-center gap-3 ml-10 flex-wrap">
-                        {lead.phone && (
-                          <a href={`tel:${lead.phone}`} onClick={e => e.stopPropagation()} className="inline-flex items-center gap-1 text-[11px] text-emerald-400 font-semibold hover:text-emerald-300 transition-colors">
-                            <Phone className="w-3 h-3" />{lead.phone}
-                          </a>
-                        )}
-                        {lead.email && (
-                          <a href={`mailto:${lead.email}`} onClick={e => e.stopPropagation()} className="inline-flex items-center gap-1 text-[11px] text-violet-400 font-semibold hover:text-violet-300 transition-colors">
-                            <Mail className="w-3 h-3" />{lead.email}
-                          </a>
-                        )}
-                        {lead.location && (
-                          <span className="text-[10px] text-white/25 flex items-center gap-1">
-                            <MapPin className="w-2.5 h-2.5" />{lead.location}
-                          </span>
-                        )}
+                        {lead.phone && <a href={`tel:${lead.phone}`} onClick={e => e.stopPropagation()} className="inline-flex items-center gap-1 text-[11px] text-emerald-400 font-semibold hover:text-emerald-300 transition-colors"><Phone className="w-3 h-3" />{lead.phone}</a>}
+                        {lead.email && <a href={`mailto:${lead.email}`} onClick={e => e.stopPropagation()} className="inline-flex items-center gap-1 text-[11px] text-violet-400 font-semibold hover:text-violet-300 transition-colors"><Mail className="w-3 h-3" />{lead.email}</a>}
+                        {lead.location && <span className="text-[10px] text-white/25 flex items-center gap-1"><MapPin className="w-2.5 h-2.5" />{lead.location}</span>}
                         {likes > 0 && <span className="text-[10px] text-white/20 flex items-center gap-1"><ThumbsUp className="w-2.5 h-2.5" />{likes}</span>}
                         {comments > 0 && <span className="text-[10px] text-white/20 flex items-center gap-1"><MessageSquare className="w-2.5 h-2.5" />{comments}</span>}
                         <span className="ml-auto text-[10px] text-indigo-400/40 opacity-0 group-hover:opacity-100 transition-opacity">View full post →</span>
@@ -886,25 +1019,11 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
 
               {groupLeadsTotalPages > 1 && (
                 <div className="px-4 py-3 border-t border-white/[0.06] flex flex-col sm:flex-row items-center justify-between gap-2">
-                  <span className="text-[11px] text-white/25 order-2 sm:order-1">
-                    {((groupLeadsPage - 1) * 50) + 1}–{Math.min(groupLeadsPage * 50, groupLeadsTotal)} of {groupLeadsTotal} posts
-                  </span>
+                  <span className="text-[11px] text-white/25 order-2 sm:order-1">{((groupLeadsPage - 1) * 50) + 1}–{Math.min(groupLeadsPage * 50, groupLeadsTotal)} of {groupLeadsTotal} posts</span>
                   <div className="flex items-center gap-1 order-1 sm:order-2">
                     <button onClick={() => fetchGroupLeads(selectedGroup.group_url, 1)} disabled={groupLeadsPage === 1} className="px-2.5 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">«</button>
                     <button onClick={() => fetchGroupLeads(selectedGroup.group_url, groupLeadsPage - 1)} disabled={groupLeadsPage <= 1} className="px-2.5 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">‹</button>
-                    {Array.from({ length: groupLeadsTotalPages }, (_, i) => i + 1)
-                      .filter(p => p === 1 || p === groupLeadsTotalPages || Math.abs(p - groupLeadsPage) <= 2)
-                      .reduce((acc, p, idx, arr) => {
-                        if (idx > 0 && p - arr[idx - 1] > 1) acc.push("...");
-                        acc.push(p);
-                        return acc;
-                      }, [])
-                      .map((p, i) => p === "..." ? (
-                        <span key={`ellipsis-${i}`} className="px-1.5 text-white/20 text-xs">…</span>
-                      ) : (
-                        <button key={p} onClick={() => fetchGroupLeads(selectedGroup.group_url, p)} className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${groupLeadsPage === p ? "bg-indigo-600 text-white" : "bg-white/5 text-white/40 hover:text-white"}`}>{p}</button>
-                      ))
-                    }
+                    {Array.from({ length: groupLeadsTotalPages }, (_, i) => i + 1).filter(p => p === 1 || p === groupLeadsTotalPages || Math.abs(p - groupLeadsPage) <= 2).reduce((acc, p, idx, arr) => { if (idx > 0 && p - arr[idx - 1] > 1) acc.push("..."); acc.push(p); return acc; }, []).map((p, i) => p === "..." ? <span key={`e-${i}`} className="px-1.5 text-white/20 text-xs">…</span> : <button key={p} onClick={() => fetchGroupLeads(selectedGroup.group_url, p)} className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${groupLeadsPage === p ? "bg-indigo-600 text-white" : "bg-white/5 text-white/40 hover:text-white"}`}>{p}</button>)}
                     <button onClick={() => fetchGroupLeads(selectedGroup.group_url, groupLeadsPage + 1)} disabled={groupLeadsPage >= groupLeadsTotalPages} className="px-2.5 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">›</button>
                     <button onClick={() => fetchGroupLeads(selectedGroup.group_url, groupLeadsTotalPages)} disabled={groupLeadsPage === groupLeadsTotalPages} className="px-2.5 py-1.5 rounded-lg bg-white/5 text-xs text-white/40 hover:text-white disabled:opacity-20 transition-colors">»</button>
                   </div>
@@ -915,9 +1034,7 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
         </div>
       )}
 
-      {selectedLead && (
-        <LeadDetailModal lead={selectedLead} onClose={() => setSelectedLead(null)} updateStatus={updateLeadStatus} />
-      )}
+      {selectedLead && <LeadDetailModal lead={selectedLead} onClose={() => setSelectedLead(null)} updateStatus={updateLeadStatus} />}
     </div>
   );
 }
@@ -1033,6 +1150,8 @@ export default function Services() {
   const [fFbGroupDebounced, setFFbGroupDebounced] = useState("");
   const [fHasPhone, setFHasPhone]       = useState(false);
   const [fHasEmail, setFHasEmail]       = useState(false);
+  const [fDateFrom, setFDateFrom]       = useState("");
+  const [fDateTo, setFDateTo]           = useState("");
   const [selectedLead, setSelectedLead] = useState(null);
   const [loading, setLoading]           = useState(false);
   const [page, setPage]                 = useState(1);
@@ -1075,6 +1194,8 @@ export default function Services() {
       if (fHasPhone)         params.has_phone        = "true";
       if (fHasEmail)         params.has_email        = "true";
       if (fFbGroupDebounced) params.fb_group         = fFbGroupDebounced;
+      if (fDateFrom)         params.date_from        = fDateFrom;
+      if (fDateTo)           params.date_to          = fDateTo;
       const res     = await axios.get(`${API}/leads/`, { headers, params });
       const data    = res.data;
       const results = Array.isArray(data) ? data : (data.results ?? []);
@@ -1088,7 +1209,7 @@ export default function Services() {
       setNewLeadsBuffer([]); setPendingNewCount(0);
     } catch (e) { console.error(e); }
     setLoading(false);
-  }, [headers, fSource, fServiceCat, fStatus, fMinScore, fSearchDebounced, fHasPhone, fHasEmail, fFbGroupDebounced]);
+  }, [headers, fSource, fServiceCat, fStatus, fMinScore, fSearchDebounced, fHasPhone, fHasEmail, fFbGroupDebounced, fDateFrom, fDateTo]);
 
   const fetchNewLeadsOnly = useCallback(async () => {
     try {
@@ -1096,12 +1217,7 @@ export default function Services() {
         || (scrapeStatus?.started_at ? new Date(new Date(scrapeStatus.started_at).getTime() - 5000).toISOString() : null)
         || new Date(Date.now() - 30_000).toISOString();
 
-      const params = {
-        page: 1,
-        page_size: 100,
-        date_after: floor,
-        ordering: "-created_at",
-      };
+      const params = { page: 1, page_size: 100, date_after: floor, ordering: "-created_at" };
       const res     = await axios.get(`${API}/leads/`, { headers, params });
       const data    = res.data;
       const results = Array.isArray(data) ? data : (data.results ?? []);
@@ -1153,7 +1269,7 @@ export default function Services() {
   useEffect(() => {
     if (isFirstRender.current) { isFirstRender.current = false; return; }
     setPage(1); fetchLeads(1);
-  }, [fSource, fServiceCat, fStatus, fMinScore, fSearchDebounced, fHasPhone, fHasEmail, fFbGroupDebounced]);
+  }, [fSource, fServiceCat, fStatus, fMinScore, fSearchDebounced, fHasPhone, fHasEmail, fFbGroupDebounced, fDateFrom, fDateTo]);
 
   useEffect(() => {
     if (!scraping) return;
@@ -1175,7 +1291,6 @@ export default function Services() {
 
   useEffect(() => { if (activeTab === "map" && leads.length > 0) geocodeFbLeads(leads); }, [activeTab, leads, geocodeFbLeads]);
 
-  // ── UPDATED: City suggestions now show "City, State" format ──
   useEffect(() => {
     if (!locationValue.trim()) { setSuggestions({ list: [], show: false }); return; }
     const q = locationValue.toLowerCase();
@@ -1187,11 +1302,7 @@ export default function Services() {
           (c.state && c.state.toLowerCase().includes(q))
         )
         .slice(0, 12)
-        .map(c => ({
-          code: c.code,
-          name: cityDisplayName(c),   // "Birmingham, Alabama"
-          rawName: c.name,             // "Birmingham" — sent to scraper
-        }));
+        .map(c => ({ code: c.code, name: cityDisplayName(c), rawName: c.name }));
       setSuggestions({ list: matches, show: matches.length > 0 });
     } else if (locationType === "state") {
       const matches = US_STATES
@@ -1225,8 +1336,6 @@ export default function Services() {
         ? fbManualGroupUrls.split(/[\n,]+/).map(u => u.trim()).filter(u => u.startsWith("http"))
         : [];
 
-      // Strip the ", State" suffix before sending to the scraper —
-      // the backend only needs the raw city name or code.
       const rawLocation = locationValue.trim().split(",")[0].trim();
 
       const res = await axios.post(`${API}/scrape/start/`, {
@@ -1298,8 +1407,38 @@ export default function Services() {
   const toggleSubService     = label => setSelectedSubServices(p => p.includes(label) ? p.filter(x => x !== label) : [...p, label]);
   const toggleCategoryExpand = k => setExpandedCategories(p => ({ ...p, [k]: !p[k] }));
   const toggleSource = s => setSelectedSources(p => p.includes(s) ? p.filter(x => x !== s) : [...p, s]);
-  const resetFilters = () => { setFSource(""); setFServiceCat(""); setFServiceLabel(""); setFStatus(""); setFMinScore(""); setFSearch(""); setFHasPhone(false); setFHasEmail(false); setFFbGroup(""); setPage(1); };
-  const hasActiveFilters  = fSource || fServiceCat || fServiceLabel || fStatus || fMinScore || fSearch || fHasPhone || fHasEmail || fFbGroup;
+  const exportLeads = useCallback(async () => {
+    const params = new URLSearchParams();
+    if (fSource)           params.set("source",           fSource);
+    if (fServiceCat)       params.set("service_category", fServiceCat);
+    if (fStatus)           params.set("status",           fStatus);
+    if (fMinScore)         params.set("min_score",        fMinScore);
+    if (fSearchDebounced)  params.set("search",           fSearchDebounced);
+    if (fHasPhone)         params.set("has_phone",        "true");
+    if (fHasEmail)         params.set("has_email",        "true");
+    if (fFbGroupDebounced) params.set("fb_group",         fFbGroupDebounced);
+    if (fDateFrom)         params.set("date_from",        fDateFrom);
+    if (fDateTo)           params.set("date_to",          fDateTo);
+    const token = localStorage.getItem("access");
+    const url   = `${API}/leads/export/?${params.toString()}`;
+    try {
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok) throw new Error("Export failed");
+      const blob    = await res.blob();
+      const link    = document.createElement("a");
+      link.href     = URL.createObjectURL(blob);
+      const cd      = res.headers.get("Content-Disposition") || "";
+      const fnMatch = cd.match(/filename="?([^"]+)"?/);
+      link.download = fnMatch ? fnMatch[1] : `leads_export.xlsx`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+    } catch (e) {
+      alert("Export failed. Please try again.");
+    }
+  }, [fSource, fServiceCat, fStatus, fMinScore, fSearchDebounced, fHasPhone, fHasEmail, fFbGroupDebounced, fDateFrom, fDateTo]);
+
+  const resetFilters = () => { setFSource(""); setFServiceCat(""); setFServiceLabel(""); setFStatus(""); setFMinScore(""); setFSearch(""); setFHasPhone(false); setFHasEmail(false); setFFbGroup(""); setFDateFrom(""); setFDateTo(""); setPage(1); };
+  const hasActiveFilters = fSource || fServiceCat || fServiceLabel || fStatus || fMinScore || fSearch || fHasPhone || fHasEmail || fFbGroup || fDateFrom || fDateTo;
   const showActivityPanel = scrapeStatus && scrapeStatus.status !== undefined && scrapeStatus.status !== "IDLE";
 
   const showGoogleSettings = selectedSources.includes("google");
@@ -1314,7 +1453,6 @@ export default function Services() {
         </div>
         <div className="p-4 space-y-4">
 
-          {/* Location type */}
           <div>
             <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-2">Location Type</label>
             <div className="grid grid-cols-3 gap-1.5 bg-white/5 p-1 rounded-xl">
@@ -1325,7 +1463,6 @@ export default function Services() {
             </div>
           </div>
 
-          {/* Location input */}
           <div className="relative">
             <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-2">
               {locationType === "city" ? "City" : locationType === "state" ? "State" : "ZIP Code"}
@@ -1343,49 +1480,26 @@ export default function Services() {
                 onFocus={() => {
                   if (locationType !== "zip" && !locationValue.trim()) {
                     if (locationType === "city") {
-                      // ── UPDATED: show all cities with "City, State" on focus ──
-                      setSuggestions({
-                        list: cities.slice(0, 50).map(c => ({
-                          code: c.code,
-                          name: cityDisplayName(c),
-                          rawName: c.name,
-                        })),
-                        show: true,
-                      });
+                      setSuggestions({ list: cities.slice(0, 50).map(c => ({ code: c.code, name: cityDisplayName(c), rawName: c.name })), show: true });
                     } else {
-                      setSuggestions({
-                        list: US_STATES.map(st => ({ code: st, name: st, rawName: st })),
-                        show: true,
-                      });
+                      setSuggestions({ list: US_STATES.map(st => ({ code: st, name: st, rawName: st })), show: true });
                     }
                   }
                 }}
                 onChange={e => { lastTypedRef.current = Date.now(); setLocationValue(e.target.value); }}
                 onBlur={() => setTimeout(() => setSuggestions(s => ({ ...s, show: false })), 180)}
-                placeholder={
-                  locationType === "city"  ? "Search cities..." :
-                  locationType === "state" ? "Search or select a state..." :
-                  "e.g. 77001"
-                }
+                placeholder={locationType === "city" ? "Search cities..." : locationType === "state" ? "Search or select a state..." : "e.g. 77001"}
                 className="w-full bg-white/5 border border-white/10 rounded-xl pl-9 pr-4 py-2.5 text-sm text-white placeholder-white/20 focus:outline-none focus:border-blue-500/60 transition-all"
               />
             </div>
 
-            {/* ── UPDATED: suggestions dropdown — state baked into name, no separate sub ── */}
             {suggestions.show && suggestions.list.length > 0 && (
               <div className="absolute z-50 left-0 right-0 mt-1 bg-[#16192a] border border-white/10 rounded-xl shadow-2xl overflow-hidden">
                 <div className="max-h-52 overflow-y-auto">
                   {suggestions.list.map(c => (
-                    <button
-                      key={c.code}
-                      onMouseDown={e => e.preventDefault()}
-                      onClick={() => {
-                        setLocationValue(c.name);       // shows "Birmingham, Alabama"
-                        setSuggestions({ list: [], show: false });
-                        setTimeout(() => locationInputRef.current?.focus(), 0);
-                      }}
-                      className="w-full text-left px-4 py-2.5 text-sm text-white/70 hover:bg-white/[0.07] hover:text-white transition-colors"
-                    >
+                    <button key={c.code} onMouseDown={e => e.preventDefault()}
+                      onClick={() => { setLocationValue(c.name); setSuggestions({ list: [], show: false }); setTimeout(() => locationInputRef.current?.focus(), 0); }}
+                      className="w-full text-left px-4 py-2.5 text-sm text-white/70 hover:bg-white/[0.07] hover:text-white transition-colors">
                       {c.name}
                     </button>
                   ))}
@@ -1401,7 +1515,6 @@ export default function Services() {
             )}
           </div>
 
-          {/* Categories */}
           <div>
             <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-2">Categories</label>
             <div className="space-y-2">
@@ -1448,7 +1561,6 @@ export default function Services() {
             </div>
           </div>
 
-          {/* Sources */}
           <div>
             <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-2">Sources</label>
             <div className="grid grid-cols-2 gap-2">
@@ -1461,7 +1573,6 @@ export default function Services() {
             </div>
           </div>
 
-          {/* Facebook settings */}
           {showFbSettings && (
             <div className="space-y-3 pt-1 border-t border-white/[0.06]">
               <div className="flex items-center gap-2 pt-1">
@@ -1479,11 +1590,9 @@ export default function Services() {
                   <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30">Posts per Group</label>
                   <span className="text-sm font-bold text-indigo-300 tabular-nums">{maxPostsPerGroup}</span>
                 </div>
-                <input
-                  type="number" min={5} max={500} value={maxPostsPerGroup}
+                <input type="number" min={5} max={500} value={maxPostsPerGroup}
                   onChange={e => setMaxPostsPerGroup(Math.max(5, Math.min(500, parseInt(e.target.value) || 50)))}
-                  className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/60 transition-all tabular-nums"
-                />
+                  className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/60 transition-all tabular-nums" />
               </div>
               <div>
                 <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-1">Group URLs</label>
@@ -1497,7 +1606,6 @@ export default function Services() {
             </div>
           )}
 
-          {/* Google settings */}
           {showGoogleSettings && (
             <div className="space-y-4 pt-1 border-t border-white/[0.06]">
               <div className="flex items-center gap-2 pt-1">
@@ -1539,7 +1647,6 @@ export default function Services() {
             </div>
           )}
 
-          {/* Launch */}
           {!scraping ? (
             <button onClick={startScrape}
               disabled={(() => {
@@ -1568,7 +1675,6 @@ export default function Services() {
 
       <ActivityPanel scrapeStatus={scrapeStatus} visible={showActivityPanel} />
 
-      {/* Filters */}
       <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
         <div className="px-4 py-3.5 border-b border-white/[0.06] flex items-center justify-between">
           <div className="flex items-center gap-2"><Filter className="w-4 h-4 text-white/40" /><span className="text-sm font-semibold">Filters</span>{hasActiveFilters && <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />}</div>
@@ -1623,6 +1729,43 @@ export default function Services() {
               <input type="text" value={fFbGroup} onChange={e => { lastTypedRef.current = Date.now(); setFFbGroup(e.target.value); }} placeholder="Group name..." autoComplete="off" autoCorrect="off" spellCheck="false" className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-white placeholder-white/20 focus:outline-none focus:border-blue-500/50 transition-all" />
             </div>
           )}
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-[10px] font-semibold uppercase tracking-widest text-white/25">Scraped Date</label>
+              {(fDateFrom || fDateTo) && (
+                <button onClick={() => { setFDateFrom(""); setFDateTo(""); }} className="text-[10px] text-white/25 hover:text-white/50 transition-colors">Clear</button>
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <div className="text-[9px] text-white/20 mb-1 uppercase tracking-widest">From</div>
+                <input
+                  type="date"
+                  value={fDateFrom}
+                  onChange={e => setFDateFrom(e.target.value)}
+                  className="w-full bg-white/5 border border-white/10 rounded-xl px-2.5 py-2 text-xs text-white focus:outline-none focus:border-blue-500/60 transition-all cursor-pointer [color-scheme:dark]"
+                />
+              </div>
+              <div>
+                <div className="text-[9px] text-white/20 mb-1 uppercase tracking-widest">To</div>
+                <input
+                  type="date"
+                  value={fDateTo}
+                  onChange={e => setFDateTo(e.target.value)}
+                  className="w-full bg-white/5 border border-white/10 rounded-xl px-2.5 py-2 text-xs text-white focus:outline-none focus:border-blue-500/60 transition-all cursor-pointer [color-scheme:dark]"
+                />
+              </div>
+            </div>
+            {(fDateFrom || fDateTo) && (
+              <p className="text-[10px] text-blue-400/60 mt-1.5">
+                {fDateFrom && fDateTo
+                  ? `${fDateFrom} → ${fDateTo}`
+                  : fDateFrom
+                  ? `From ${fDateFrom}`
+                  : `Until ${fDateTo}`}
+              </p>
+            )}
+          </div>
         </div>
       </div>
     </>
@@ -1634,7 +1777,6 @@ export default function Services() {
 
       {scraping && pendingNewCount > 0 && <NewLeadsBanner count={pendingNewCount} onView={() => { setPendingNewCount(0); setActiveTab("leads"); window.scrollTo({ top: 0, behavior: "smooth" }); }} />}
 
-      {/* Mobile sidebar overlay */}
       {sidebarOpen && (
         <div className="fixed inset-0 z-40 lg:hidden" onClick={() => setSidebarOpen(false)}>
           <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
@@ -1718,7 +1860,7 @@ export default function Services() {
                   </div>
                   {(scrapeStatus?.activity_log?.length ?? 0) > 0 && (
                     <div className="w-full max-w-md space-y-1">
-                      {[...(scrapeStatus.activity_log)].reverse().slice(0, 3).map((entry, i) => {
+                      {[...(scrapeStatus.activity_log)].filter(e => e.type !== "source_stats").reverse().slice(0, 3).map((entry, i) => {
                         const cfg = LOG_CFG[entry.level] || LOG_CFG.info;
                         const Icon = cfg.icon;
                         return (
@@ -1740,11 +1882,7 @@ export default function Services() {
               ) : (
                 <div className="divide-y divide-white/[0.04] max-h-[420px] overflow-y-auto">
                   {leads.slice(0, 25).map((lead, i) => (
-                    <div
-                      key={lead.post_id}
-                      className={`px-4 py-3 flex items-start gap-3 hover:bg-white/[0.02] cursor-pointer transition-all ${i === 0 ? "bg-emerald-500/[0.03]" : ""}`}
-                      onClick={() => setSelectedLead(lead)}
-                    >
+                    <div key={lead.post_id} className={`px-4 py-3 flex items-start gap-3 hover:bg-white/[0.02] cursor-pointer transition-all ${i === 0 ? "bg-emerald-500/[0.03]" : ""}`} onClick={() => setSelectedLead(lead)}>
                       <SourceTag source={lead.source} />
                       <div className="flex-1 min-w-0">
                         <p className="text-xs font-medium text-white/75 truncate">{lead.title}</p>
@@ -1771,7 +1909,6 @@ export default function Services() {
           )}
 
           {!scraping && (<>
-            {/* Stats row */}
             <div className="grid grid-cols-3 sm:grid-cols-7 gap-2">
               {[
                 { label: "Total",      value: stats.total,     icon: Database,   color: "text-blue-400" },
@@ -1790,7 +1927,6 @@ export default function Services() {
               ))}
             </div>
 
-            {/* Tab bar */}
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div className="flex gap-1 bg-white/[0.03] border border-white/[0.06] p-1 rounded-xl">
                 {[
@@ -1818,10 +1954,22 @@ export default function Services() {
                 <button onClick={fetchLeads} className="flex items-center gap-1.5 text-xs text-white/30 hover:text-white/60 transition-colors">
                   <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} /><span className="hidden sm:inline">Refresh</span>
                 </button>
+                {activeTab === "leads" && totalLeads > 0 && (
+                  <button
+                    onClick={exportLeads}
+                    title={`Export ${totalLeads.toLocaleString()} leads to Excel`}
+                    className="flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/25 text-emerald-400 hover:bg-emerald-500/20 hover:border-emerald-500/40 transition-all"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">Export</span>
+                    <span className="bg-emerald-500/20 text-emerald-300 text-[10px] font-bold px-1.5 py-0.5 rounded-full tabular-nums">
+                      {totalLeads.toLocaleString()}
+                    </span>
+                  </button>
+                )}
               </div>
             </div>
 
-            {/* Leads tab */}
             {activeTab === "leads" && (
               <div>
                 {loading ? (
@@ -1848,7 +1996,6 @@ export default function Services() {
               </div>
             )}
 
-            {/* Groups tab */}
             {activeTab === "groups" && (
               <FbGroupsPanel
                 headers={headers}
@@ -1861,7 +2008,6 @@ export default function Services() {
               />
             )}
 
-            {/* Map tab */}
             {activeTab === "map" && (
               <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
                 <div className="px-4 py-3 border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-2">
@@ -1900,7 +2046,6 @@ export default function Services() {
               </div>
             )}
 
-            {/* History tab */}
             {activeTab === "history" && (
               <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
                 <div className="px-5 py-4 border-b border-white/[0.06]"><span className="text-sm font-semibold">Scrape History</span></div>
@@ -1920,6 +2065,19 @@ export default function Services() {
                             <span>{run.sources?.join(", ") || "---"}</span><span>·</span>
                             <span>{new Date(run.started_at).toLocaleString()}</span>
                           </div>
+                          {run.source_stats && Object.keys(run.source_stats).length > 0 && (
+                            <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                              {Object.entries(run.source_stats).map(([src, s]) => {
+                                const cfg = SOURCE_CFG[src.toUpperCase()];
+                                if (!cfg || !s.saved) return null;
+                                return (
+                                  <span key={src} className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${cfg.badge}`}>
+                                    {cfg.label} {s.saved}
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          )}
                         </div>
                         <div className="text-right flex-shrink-0">
                           <div className="text-lg font-bold tabular-nums">{run.leads_collected}</div>

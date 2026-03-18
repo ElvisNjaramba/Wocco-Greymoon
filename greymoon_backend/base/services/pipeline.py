@@ -1,12 +1,12 @@
 """
 pipeline.py  —  manual-groups-only Facebook integration
 ────────────────────────────────────────────────────────
-Changes from previous version
-  • Facebook Phase A (group discovery/search) fully removed.
-  • Only manual group URLs are scraped (Phase B).
-  • _process_and_save_fb_batch saves leads immediately after each
-    Apify batch so no data is lost on abort/failure/timeout.
-  • Google enrich_callback correctly wired (unchanged logic, kept).
+Changes:
+  • _make_progress_callback: fires every ~10s from inside Apify poll loops,
+    updates stage_detail with live "~N items found by Apify / M saved to DB"
+    so the frontend can show real-time counts before a batch completes.
+  • progress_callback wired into all three scrapers (CL, FB, Google).
+  • All other logic unchanged.
 """
 
 import threading
@@ -20,19 +20,20 @@ from .normalizer import normalize_craigslist, normalize_facebook
 from .google_normalizer import normalize_google_serp_page
 from .lead_scorer import calculate_lead_score
 
-# ── Source → search term maps ─────────────────────────────────
-
 GOOGLE_CATEGORY_QUERIES = {
     "cleaning":         "house cleaning service contractor",
     "maintenance":      "home maintenance handyman contractor",
     "waste_management": "junk removal waste management contractor",
 }
 
+
 # ── Logging helper ────────────────────────────────────────────
 
-def _log(scrape_run_id, stage: str, detail: str, level: str = "info"):
+def _log(scrape_run_id, stage: str, detail: str, level: str = "info", extra: dict = None):
     ts    = datetime.now(timezone.utc).isoformat()
     entry = {"ts": ts, "stage": stage, "detail": detail, "level": level}
+    if extra:
+        entry.update(extra)
     print(f"[Pipeline][{level.upper()}] {stage}: {detail}")
     if not scrape_run_id:
         return
@@ -50,6 +51,78 @@ def _log(scrape_run_id, stage: str, detail: str, level: str = "info"):
         )
     except Exception as e:
         print(f"[Pipeline] Could not write log entry: {e}")
+
+
+def _emit_source_stats(scrape_run_id, source: str, saved: int, skipped: int, batch_saved: int = 0):
+    """
+    Emit a structured source_stats log entry so the frontend can parse
+    per-source totals from the activity log in real time.
+    """
+    if not scrape_run_id:
+        return
+    try:
+        from base.models import ScrapeRun
+        ts = datetime.now(timezone.utc).isoformat()
+        entry = {
+            "ts":          ts,
+            "stage":       f"{source.title()} — live count",
+            "detail":      f"{saved} lead(s) saved ({skipped} duplicate(s) skipped)",
+            "level":       "success" if saved > 0 else "info",
+            "type":        "source_stats",
+            "source":      source,
+            "saved":       saved,
+            "skipped":     skipped,
+            "batch_saved": batch_saved,
+        }
+
+        run = ScrapeRun.objects.filter(pk=scrape_run_id).first()
+        if not run:
+            return
+
+        log = run.activity_log or []
+        log = [e for e in log if not (e.get("type") == "source_stats" and e.get("source") == source)]
+        log.append(entry)
+
+        source_stats = run.source_stats or {}
+        source_stats[source] = {"saved": saved, "skipped": skipped}
+
+        ScrapeRun.objects.filter(pk=scrape_run_id).update(
+            activity_log=log,
+            source_stats=source_stats,
+        )
+    except Exception as e:
+        print(f"[Pipeline] Could not emit source stats: {e}")
+
+
+# ── Live progress callback ────────────────────────────────────
+
+def _make_progress_callback(scrape_run_id, source_label: str, stats: dict):
+    """
+    Returns a callback fired every ~10s from inside each scraper's Apify
+    poll loop with the current dataset item count from Apify.
+
+    Updates stage_detail immediately so the frontend sees it within 2s
+    via the /scrape/status/ poll — no need to wait for a batch to finish.
+
+    Format shown in the UI hero card stageDetail:
+        "~47 results found by Apify | 12 saved to DB so far"
+    """
+    def callback(apify_count: int):
+        if not scrape_run_id:
+            return
+        try:
+            from base.models import ScrapeRun
+            already_saved = stats.get("leads_saved", 0)
+            detail = (
+                f"~{apify_count} result(s) found by Apify "
+                f"| {already_saved} lead(s) saved to DB so far"
+            )
+            ScrapeRun.objects.filter(pk=scrape_run_id).update(
+                stage_detail=detail,
+            )
+        except Exception:
+            pass
+    return callback
 
 
 # ── Service logger ─────────────────────────────────────────────
@@ -96,12 +169,11 @@ def _cancelled(scrape_run_id) -> bool:
 
 # ── Batch save helper ─────────────────────────────────────────
 
-def _save_lead_batch(normalized_items, stats, scrape_run_id=None):
+def _save_lead_batch(normalized_items, stats, scrape_run_id=None, source_key: str = None):
     """
     Save a list of normalised lead dicts to ServiceLead.
     Dedup via content_hash and post_id.
-    Saves each lead individually and updates the run counter
-    immediately so live counts are accurate.
+    Updates run counter after every individual lead for live UI counts.
     """
     from base.models import ServiceLead, ScrapeRun
 
@@ -123,16 +195,24 @@ def _save_lead_batch(normalized_items, stats, scrape_run_id=None):
         .values_list("post_id", flat=True)
     ) if incoming_ids else set()
 
+    batch_saved_count = 0
+
     for lead_data in normalized_items:
         try:
             content_hash = lead_data.get("content_hash")
             if content_hash and content_hash in existing_hashes:
                 stats["leads_skipped"] += 1
+                if source_key:
+                    stats.setdefault("source_skipped", {})
+                    stats["source_skipped"][source_key] = stats["source_skipped"].get(source_key, 0) + 1
                 continue
 
             post_id = lead_data.get("post_id")
             if post_id and post_id in existing_ids:
                 stats["leads_skipped"] += 1
+                if source_key:
+                    stats.setdefault("source_skipped", {})
+                    stats["source_skipped"][source_key] = stats["source_skipped"].get(source_key, 0) + 1
                 continue
 
             score, score_reason = calculate_lead_score(lead_data)
@@ -172,6 +252,11 @@ def _save_lead_batch(normalized_items, stats, scrape_run_id=None):
                 raw_json=lead_data.get("raw_json"),
             )
             stats["leads_saved"] += 1
+            batch_saved_count += 1
+
+            if source_key:
+                stats.setdefault("source_saved", {})
+                stats["source_saved"][source_key] = stats["source_saved"].get(source_key, 0) + 1
 
             if content_hash:
                 existing_hashes.add(content_hash)
@@ -193,6 +278,11 @@ def _save_lead_batch(normalized_items, stats, scrape_run_id=None):
             print(f"[Pipeline] {err_msg}")
             _log(scrape_run_id, "Pipeline — save error", err_msg, level="error")
             stats["errors"].append(err_msg)
+
+    if source_key and scrape_run_id and batch_saved_count > 0:
+        src_saved   = stats.get("source_saved", {}).get(source_key, 0)
+        src_skipped = stats.get("source_skipped", {}).get(source_key, 0)
+        _emit_source_stats(scrape_run_id, source_key, src_saved, src_skipped, batch_saved_count)
 
 
 # ── Google contact enrichment (background thread) ─────────────
@@ -261,11 +351,6 @@ def _process_and_save_fb_batch(
     total_chunks,
     svc_log,
 ):
-    """
-    Deduplicate (via ScrapedFbPost), normalise, save leads, and
-    write ScrapedFbPost records for this chunk.
-    No category or location required — FB posts are self-contained.
-    """
     from base.models import ScrapedFbPost
 
     chunk_names = ", ".join(group_name_map.get(u, u) for u in chunk_urls[:3])
@@ -311,16 +396,13 @@ def _process_and_save_fb_batch(
             f"{len(fresh_items)} new post(s) to process.",
         )
 
-    # Normalise with no category or location — both default to ""
     normalized = [
         normalize_facebook(item, service_category="", location_str="")
         for item in fresh_items
     ]
 
-    # ── Save immediately so data is never lost ────────────────
-    _save_lead_batch(normalized, stats, scrape_run_id)
+    _save_lead_batch(normalized, stats, scrape_run_id, source_key="facebook")
 
-    # ── Write ScrapedFbPost records right after saving ────────
     new_post_records = []
     for item in fresh_items:
         url = _item_url(item)
@@ -340,11 +422,14 @@ def _process_and_save_fb_batch(
     if new_post_records:
         ScrapedFbPost.objects.bulk_create(new_post_records, ignore_conflicts=True)
 
+    fb_saved   = stats.get("source_saved", {}).get("facebook", 0)
+    fb_skipped = stats.get("source_skipped", {}).get("facebook", 0)
+
     _log(
         scrape_run_id,
         f"Facebook — chunk {chunk_num} saved",
         f"{len(fb_batch)} retrieved → {len(fresh_items)} fresh → "
-        f"{stats['leads_saved']} total saved, {stats['leads_skipped']} duplicate(s).",
+        f"{fb_saved} FB leads saved, {fb_skipped} duplicate(s).",
         level="success",
     )
 
@@ -364,7 +449,13 @@ def run_pipeline(
 ):
     from base.models import ScrapeRun
 
-    stats   = {"leads_saved": 0, "leads_skipped": 0, "errors": []}
+    stats = {
+        "leads_saved":    0,
+        "leads_skipped":  0,
+        "errors":         [],
+        "source_saved":   {},
+        "source_skipped": {},
+    }
     svc_log = _ServiceLogger(scrape_run_id)
 
     # ── Step 1: Resolve location ──────────────────────────────
@@ -398,7 +489,7 @@ def run_pipeline(
             "No location set — Facebook-only run.", level="info",
         )
 
-    # ── Step 2: Resolve categories (only needed for CL / Google) ─
+    # ── Step 2: Resolve categories ────────────────────────────
     cl_codes = get_craigslist_codes(categories) if categories else []
     if categories:
         _log(
@@ -431,6 +522,9 @@ def run_pipeline(
                 cl_cities, cl_codes,
                 scrape_run_id=scrape_run_id,
                 _log_fn=svc_log,
+                progress_callback=_make_progress_callback(
+                    scrape_run_id, "Craigslist", stats
+                ),
             ):
                 batch_num += 1
                 fresh = [
@@ -440,6 +534,10 @@ def run_pipeline(
                 skipped_known = len(batch_items) - len(fresh)
                 if skipped_known:
                     stats["leads_skipped"] += skipped_known
+                    stats.setdefault("source_skipped", {})
+                    stats["source_skipped"]["craigslist"] = (
+                        stats["source_skipped"].get("craigslist", 0) + skipped_known
+                    )
 
                 _log(
                     scrape_run_id,
@@ -454,26 +552,29 @@ def run_pipeline(
                     )
                     for item in fresh
                 ]
-                _save_lead_batch(normalized, stats, scrape_run_id)
+                _save_lead_batch(normalized, stats, scrape_run_id, source_key="craigslist")
 
                 for item in fresh:
                     pid = str(item.get("id") or "")
                     if pid:
                         existing_cl_ids.add(pid)
 
+                cl_saved   = stats.get("source_saved", {}).get("craigslist", 0)
+                cl_skipped = stats.get("source_skipped", {}).get("craigslist", 0)
+
                 _log(
                     scrape_run_id,
                     f"Craigslist — batch {batch_num} saved",
                     f"{len(normalized)} processed — "
-                    f"{stats['leads_saved']} saved, "
-                    f"{stats['leads_skipped']} duplicate(s).",
+                    f"{cl_saved} CL leads saved, "
+                    f"{cl_skipped} duplicate(s).",
                     level="success",
                 )
 
             _log(
                 scrape_run_id, "Craigslist — complete",
                 f"All {batch_num} batch(es) done. "
-                f"{stats['leads_saved']} lead(s) saved.",
+                f"{stats.get('source_saved', {}).get('craigslist', 0)} CL lead(s) saved.",
                 level="success",
             )
 
@@ -488,7 +589,7 @@ def run_pipeline(
             level="warning",
         )
 
-    # ── Step 4: Facebook (manual groups only) ─────────────────
+    # ── Step 4: Facebook ──────────────────────────────────────
     if "facebook" in sources:
         manual_group_urls = [u.strip() for u in (fb_group_urls or []) if u.strip()]
 
@@ -545,6 +646,10 @@ def run_pipeline(
             run.leads_collected = stats["leads_saved"]
             run.leads_skipped   = stats["leads_skipped"]
             run.finished_at     = datetime.now(timezone.utc)
+            run.source_stats = {
+                k: {"saved": v, "skipped": stats.get("source_skipped", {}).get(k, 0)}
+                for k, v in stats.get("source_saved", {}).items()
+            }
             run.save()
         except Exception as e:
             print(f"[Pipeline] Could not update ScrapeRun: {e}")
@@ -561,7 +666,7 @@ def run_pipeline(
     return stats
 
 
-# ── Facebook sub-pipeline (manual groups only) ────────────────
+# ── Facebook sub-pipeline ─────────────────────────────────────
 
 def _run_facebook_pipeline(
     *,
@@ -571,11 +676,6 @@ def _run_facebook_pipeline(
     scrape_run_id,
     svc_log,
 ):
-    """
-    Scrapes posts from the supplied manual group URLs.
-    Completely independent of categories and location.
-    """
-    # Normalise URLs
     all_group_urls: list[str] = []
     seen: set[str] = set()
     for url in manual_group_urls:
@@ -599,7 +699,6 @@ def _run_facebook_pipeline(
         f"already-scraped posts will be skipped)…",
     )
 
-    # Build group name lookup for nice log messages
     group_name_map: dict[str, str] = {}
     try:
         from base.models import ScrapedFbGroup
@@ -610,7 +709,7 @@ def _run_facebook_pipeline(
     except Exception:
         pass
 
-    total_chunks = -(-len(all_group_urls) // 5)  # ceil(n/5)
+    total_chunks = -(-len(all_group_urls) // 5)
     chunk_num    = 0
 
     try:
@@ -619,6 +718,9 @@ def _run_facebook_pipeline(
             max_posts_per_group=max_posts_per_group,
             scrape_run_id=scrape_run_id,
             log=svc_log,
+            progress_callback=_make_progress_callback(
+                scrape_run_id, "Facebook", stats
+            ),
         ):
             chunk_num += 1
 
@@ -654,18 +756,20 @@ def _run_facebook_pipeline(
             )
 
             if _cancelled(scrape_run_id):
+                fb_saved = stats.get("source_saved", {}).get("facebook", 0)
                 _log(
                     scrape_run_id, "Facebook — cancelled",
                     f"Cancelled after chunk {chunk_num}. "
-                    f"{stats['leads_saved']} lead(s) saved.",
+                    f"{fb_saved} FB lead(s) saved.",
                     level="warning",
                 )
                 return
 
+        fb_saved = stats.get("source_saved", {}).get("facebook", 0)
         _log(
             scrape_run_id, "Facebook — complete",
             f"All {chunk_num} chunk(s) processed. "
-            f"{stats['leads_saved']} total lead(s) saved.",
+            f"{fb_saved} FB lead(s) saved.",
             level="success",
         )
 
@@ -732,6 +836,9 @@ def _run_google_pipeline(
             enrich_callback=lambda cm: _enrich_saved_google_leads(
                 cm, scrape_run_id, svc_log
             ),
+            progress_callback=_make_progress_callback(
+                scrape_run_id, "Google", stats
+            ),
         ):
             query_num += 1
 
@@ -750,6 +857,10 @@ def _run_google_pipeline(
                     url = lead.get("url", "")
                     if url and url in existing_google_urls:
                         stats["leads_skipped"] += 1
+                        stats.setdefault("source_skipped", {})
+                        stats["source_skipped"]["google"] = (
+                            stats["source_skipped"].get("google", 0) + 1
+                        )
                         continue
                     all_leads.append(lead)
                     if url:
@@ -771,14 +882,17 @@ def _run_google_pipeline(
                 f"{len(serp_pages)} SERP page(s). Saving now…",
             )
 
-            _save_lead_batch(all_leads, stats, scrape_run_id)
+            _save_lead_batch(all_leads, stats, scrape_run_id, source_key="google")
+
+            gg_saved   = stats.get("source_saved", {}).get("google", 0)
+            gg_skipped = stats.get("source_skipped", {}).get("google", 0)
 
             _log(
                 scrape_run_id,
                 f"Google Search — query {query_num} saved",
                 f"{len(all_leads)} processed — "
-                f"{stats['leads_saved']} total saved, "
-                f"{stats['leads_skipped']} duplicate(s).",
+                f"{gg_saved} GG leads saved, "
+                f"{gg_skipped} duplicate(s).",
                 level="success",
             )
 
@@ -789,17 +903,18 @@ def _run_google_pipeline(
                 _log(
                     scrape_run_id, "Google Search — cancelled",
                     f"Cancelled after query {query_num}. "
-                    f"{stats['leads_saved']} lead(s) saved so far.",
+                    f"{gg_saved} GG lead(s) saved so far.",
                     level="warning",
                 )
                 return
 
         if query_num > 0:
+            gg_saved = stats.get("source_saved", {}).get("google", 0)
             _log(
                 scrape_run_id, "Google Search — complete",
                 f"All {query_num} "
                 f"quer{'y' if query_num == 1 else 'ies'} done. "
-                f"{stats['leads_saved']} total lead(s) saved.",
+                f"{gg_saved} GG lead(s) saved.",
                 level="success",
             )
         else:

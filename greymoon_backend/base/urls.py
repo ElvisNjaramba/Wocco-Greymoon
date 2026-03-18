@@ -4,7 +4,7 @@ from .views import (
     list_services, update_lead_status,
     get_cities, get_categories,
     list_scraped_groups, list_group_leads, delete_scraped_group,
-    add_fb_groups, scrape_selected_groups,
+    add_fb_groups, scrape_selected_groups, export_leads
 )
 
 urlpatterns = [
@@ -17,6 +17,7 @@ urlpatterns = [
     # ── Leads ────────────────────────────────────────────────────
     path("leads/",                         list_services,      name="leads_list"),
     path("leads/<str:post_id>/status/",    update_lead_status, name="lead_status_update"),
+    path("leads/export/", export_leads, name="leads_export"),
 
     # ── FB Groups ────────────────────────────────────────────────
     path("fb-groups/",         list_scraped_groups,   name="fb_groups_list"),
