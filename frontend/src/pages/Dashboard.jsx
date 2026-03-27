@@ -10,7 +10,7 @@ import {
   Menu, LayoutGrid, List, Plus, Play, Trash2, Download,
 } from "lucide-react";
 
-const API = "http://127.0.0.1:8000/api";
+const API = "https://greymoonignorelistcom.dbm.shared-servers.com/api";
 
 const _geocodeCache = {};
 let _lastGeoReq = 0;
