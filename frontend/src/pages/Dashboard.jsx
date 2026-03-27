@@ -1114,7 +1114,10 @@ export default function Services() {
   const [selectedCategories, setSelectedCategories]   = useState([]);
   const [selectedSubServices, setSelectedSubServices] = useState([]);
   const [expandedCategories, setExpandedCategories]   = useState({});
+
   const [maxPostsPerGroup, setMaxPostsPerGroup]       = useState(50);
+  const [maxLeads, setMaxLeads] = useState(0);
+
   const [fbManualGroupUrls, setFbManualGroupUrls]     = useState("");
   const [googleMaxPages, setGoogleMaxPages]   = useState(3);
   const [googleDeepScrape, setGoogleDeepScrape] = useState(true);
@@ -1330,6 +1333,7 @@ export default function Services() {
         fb_group_urls: fbGroupUrlsClean,
         google_max_pages:   googleMaxPages,
         google_deep_scrape: googleDeepScrape,
+        max_leads: maxLeads,
       }, { headers });
       setRunId(res.data.run_id);
       fetchHistory();
@@ -1630,6 +1634,38 @@ export default function Services() {
               </div>
             </div>
           )}
+
+
+          {/* ── Max Leads cap ── */}
+<div className="space-y-1.5 pt-1 border-t border-white/[0.06]">
+  <div className="flex items-center justify-between">
+    <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30">
+      Lead Limit
+    </label>
+    <span className="text-xs font-bold tabular-nums text-white/50">
+      {maxLeads === 0 ? "Unlimited" : maxLeads}
+    </span>
+  </div>
+  <input
+    type="number"
+    min={0}
+    max={10000}
+    step={10}
+    value={maxLeads}
+    onChange={e => setMaxLeads(Math.max(0, parseInt(e.target.value) || 0))}
+    placeholder="0 = no limit"
+    className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2.5 text-sm text-white placeholder-white/20 focus:outline-none focus:border-blue-500/60 transition-all tabular-nums"
+  />
+  <p className="text-[10px] text-white/20 leading-relaxed">
+    Stop automatically after this many leads are saved. Set to <span className="text-white/35 font-semibold">0</span> for no limit.
+  </p>
+  {maxLeads > 0 && (
+    <div className="flex items-center gap-1.5 bg-amber-500/5 border border-amber-500/15 rounded-lg px-2.5 py-1.5">
+      <Target className="w-3 h-3 text-amber-400/70 flex-shrink-0" />
+      <span className="text-[10px] text-amber-300/60">Run will stop as soon as {maxLeads} lead{maxLeads !== 1 ? "s" : ""} are saved</span>
+    </div>
+  )}
+</div>
 
           {!scraping ? (
             <button onClick={startScrape}
