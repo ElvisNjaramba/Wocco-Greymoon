@@ -844,8 +844,8 @@ function FbGroupsPanel({ headers, scrapeStatus, scraping, onScrapeDone }) {
                 min={5}
                 max={500}
                 value={maxPosts}
-                onChange={e => setMaxPosts(Math.max(5, Math.min(500, parseInt(e.target.value) || 50)))}
-                className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-indigo-500/60 tabular-nums"
+onChange={e => setMaxPosts(parseInt(e.target.value) || "")}
+onBlur={e => setMaxPosts(Math.max(5, Math.min(500, parseInt(e.target.value) || 50)))}                className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-indigo-500/60 tabular-nums"
               />
               <p className="text-[10px] text-white/20">Already-scraped posts are always skipped</p>
             </div>
@@ -1579,7 +1579,8 @@ export default function Services() {
                   <span className="text-sm font-bold text-indigo-300 tabular-nums">{maxPostsPerGroup}</span>
                 </div>
                 <input type="number" min={5} max={500} value={maxPostsPerGroup}
-                  onChange={e => setMaxPostsPerGroup(Math.max(5, Math.min(500, parseInt(e.target.value) || 50)))}
+onChange={e => setMaxPostsPerGroup(parseInt(e.target.value) || "")}
+onBlur={e => setMaxPostsPerGroup(Math.max(5, Math.min(500, parseInt(e.target.value) || 50)))}
                   className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/60 transition-all tabular-nums" />
               </div>
               <div>
