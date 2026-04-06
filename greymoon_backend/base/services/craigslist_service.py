@@ -223,8 +223,14 @@ def scrape_craigslist_progressive(
                 log(f"[Craigslist] Could not fetch partial dataset: {fetch_err}")
             return
 
+        if _is_cancel_requested(scrape_run_id):
+            log(f"[Craigslist] Cancel requested after run — skipping dataset fetch")
+            return
+
         results = fetch_dataset(dataset_id)
+
         log(f"[Craigslist] Got {len(results)} results from batch {i+1}")
+
         yield results
 
         if i < len(batches) - 1:

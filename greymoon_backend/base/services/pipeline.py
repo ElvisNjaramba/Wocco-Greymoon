@@ -84,7 +84,7 @@ def _emit_source_stats(scrape_run_id, source: str, saved: int, skipped: int, bat
         print(f"[Pipeline] Could not emit source stats: {e}")
 
 
-def _make_progress_callback(scrape_run_id, source_label: str, stats: dict):
+def _make_progress_callback(scrape_run_id, source_label: str, stats: dict, max_leads: int = 0):
     def callback(apify_count: int):
         if not scrape_run_id:
             return
@@ -96,10 +96,12 @@ def _make_progress_callback(scrape_run_id, source_label: str, stats: dict):
                 f"| {already_saved} lead(s) saved to DB so far"
             )
             ScrapeRun.objects.filter(pk=scrape_run_id).update(stage_detail=detail)
+
+            if max_leads and already_saved >= max_leads:
+                _abort_all_actors(scrape_run_id)
         except Exception:
             pass
     return callback
-
 
 class _ServiceLogger:
     def __init__(self, scrape_run_id, default_stage="Background"):
@@ -640,7 +642,7 @@ def run_pipeline(
                 scrape_run_id=scrape_run_id,
                 _log_fn=svc_log,
                 progress_callback=_make_progress_callback(
-                    scrape_run_id, "Craigslist", stats
+                    scrape_run_id, "Craigslist", stats, max_leads=max_leads
                 ),
             ):
                 batch_num += 1
@@ -878,7 +880,7 @@ def _run_facebook_pipeline(
         scrape_run_id=scrape_run_id,
         log=svc_log,
         progress_callback=_make_progress_callback(
-            scrape_run_id, "Facebook", stats
+            scrape_run_id, "Facebook", stats, max_leads=max_leads
         ),
     ):
         chunk_num += 1
@@ -992,7 +994,7 @@ def _run_google_pipeline(
             cm, scrape_run_id, svc_log
         ),
         progress_callback=_make_progress_callback(
-            scrape_run_id, "Google", stats
+            scrape_run_id, "Google", stats, max_leads=max_leads
         ),
     ):
         query_num += 1
