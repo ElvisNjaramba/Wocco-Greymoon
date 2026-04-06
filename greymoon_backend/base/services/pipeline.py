@@ -90,37 +90,32 @@ def _make_progress_callback(scrape_run_id, source_label: str, stats: dict, max_l
             return
         try:
             from base.models import ScrapeRun
-
+ 
             already_saved = stats.get("leads_saved", 0)
             detail = (
                 f"~{apify_count} result(s) found by Apify "
                 f"| {already_saved} lead(s) saved to DB so far"
             )
-            # ✅ NEW: also update leads_collected live so frontend sees DB count in real-time
-            ScrapeRun.objects.filter(pk=scrape_run_id).update(
-                stage_detail=detail,
-                leads_collected=already_saved,   # <-- ADD THIS
-            )
-
+            ScrapeRun.objects.filter(pk=scrape_run_id).update(stage_detail=detail)
+ 
             if not max_leads:
-                return
-
-            # ✅ FIXED: base early-abort on DB-saved leads, not Apify estimate
-            limit_already_hit = already_saved >= max_leads
-
-            if limit_already_hit:
-                # ✅ NEW: set a "stopping" stage so frontend pill shows "Stopping..."
-                ScrapeRun.objects.filter(pk=scrape_run_id).update(
-                    current_stage=f"Stopping — lead limit of {max_leads} reached",
-                    stage_detail=f"{already_saved} lead(s) saved to DB — wrapping up actors...",
-                )
+                return  # unlimited — nothing to do
+ 
+            # ── FIX: abort as soon as the actor has found enough ──
+            remaining = max(0, max_leads - already_saved)
+ 
+            limit_already_hit  = already_saved >= max_leads          
+            actor_has_enough   = remaining > 0 and apify_count >= remaining * 2  
+ 
+            if limit_already_hit or actor_has_enough:
                 _abort_all_actors(scrape_run_id)
-
+ 
         except Exception:
             pass
-
+ 
     return callback
-    
+
+
 class _ServiceLogger:
     def __init__(self, scrape_run_id, default_stage="Background"):
         self._run_id  = scrape_run_id
