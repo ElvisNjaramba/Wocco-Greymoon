@@ -74,16 +74,6 @@ def _apply_lead_filters(leads, params):
     if fb_group:
         leads = leads.filter(fb_group_name__icontains=fb_group)
 
-    date_after = params.get("date_after")
-    if date_after:
-        try:
-            from django.utils.dateparse import parse_datetime
-            dt = parse_datetime(date_after)
-            if dt:
-                leads = leads.filter(created_at__gte=dt)
-        except Exception:
-            pass
-
     date_from = params.get("date_from")
     if date_from:
         try:
@@ -162,6 +152,13 @@ def manual_scrape(request):
     google_max_pages   = max(1, min(google_max_pages, 10))
     google_deep_scrape = bool(data.get("google_deep_scrape", True))
 
+    # ── max_leads (0 = unlimited) ──────────────────────────────
+    try:
+        max_leads = int(data.get("max_leads", 0))
+    except (TypeError, ValueError):
+        max_leads = 0
+    max_leads = max(0, max_leads)
+
     if location_value:
         try:
             location_data = resolve_location(location_type, location_value)
@@ -186,6 +183,7 @@ def manual_scrape(request):
         activity_log=[],
         google_max_pages=google_max_pages,
         google_deep_scrape=google_deep_scrape,
+        max_leads=max_leads,
     )
 
     start_pipeline_thread(
@@ -198,6 +196,7 @@ def manual_scrape(request):
         fb_group_urls=fb_group_urls,
         google_max_pages=google_max_pages,
         google_deep_scrape=google_deep_scrape,
+        max_leads=max_leads,
     )
 
     return Response({
@@ -207,9 +206,9 @@ def manual_scrape(request):
         "categories": categories,
         "sources": sources,
         "fb_groups": len(fb_group_urls),
+        "max_leads": max_leads or "unlimited",
         "estimated_time": "2–10 minutes depending on sources and group size",
     }, status=202)
-
 
 
 def _sweep_and_abort(apify_headers: dict, already_aborted: set) -> list[str]:
@@ -341,8 +340,11 @@ def scrape_status(request):
         "activity_log":    run.activity_log or [],
         "started_at":      run.created_at,
         "finished_at":     run.finished_at,
-    })
+        "max_leads":       run.max_leads,
+        "limit_stop":      run.limit_stop,
+        "cancel_requested": run.cancel_requested,
 
+    })
 
 
 @api_view(["GET"])
@@ -360,6 +362,8 @@ def scrape_history(request):
             "leads_skipped":   r.leads_skipped,
             "started_at":      r.created_at,
             "finished_at":     r.finished_at,
+            "max_leads":       r.max_leads,
+            "limit_stop":      r.limit_stop,
         }
         for r in runs
     ])
@@ -419,6 +423,7 @@ def list_scraped_groups(request):
 
     return Response({"groups": groups, "total": len(groups)})
 
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def scrape_selected_groups(request):
@@ -432,6 +437,12 @@ def scrape_selected_groups(request):
 
     max_posts_per_group = int(request.data.get("max_posts_per_group", 50))
     max_posts_per_group = max(5, min(max_posts_per_group, 500))
+
+    try:
+        max_leads = int(request.data.get("max_leads", 0))
+    except (TypeError, ValueError):
+        max_leads = 0
+    max_leads = max(0, max_leads)
 
     run = ScrapeRun.objects.create(
         run_id=str(uuid.uuid4()),
@@ -447,6 +458,7 @@ def scrape_selected_groups(request):
         activity_log=[],
         google_max_pages=3,
         google_deep_scrape=False,
+        max_leads=max_leads,
     )
 
     start_pipeline_thread(
@@ -457,6 +469,7 @@ def scrape_selected_groups(request):
         scrape_run_id=run.pk,
         max_posts_per_group=max_posts_per_group,
         fb_group_urls=group_urls,
+        max_leads=max_leads,
     )
 
     return Response({
@@ -464,8 +477,8 @@ def scrape_selected_groups(request):
         "run_id":    run.run_id,
         "groups":    len(group_urls),
         "max_posts": max_posts_per_group,
+        "max_leads": max_leads or "unlimited",
     }, status=202)
-
 
 
 @api_view(["GET"])
@@ -489,7 +502,6 @@ def list_group_leads(request):
         "total_pages": total_pages,
         "has_next":    page < total_pages,
     })
-
 
 
 @api_view(["DELETE"])
@@ -552,6 +564,7 @@ def list_services(request):
         "has_next":    page < total_pages,
         "has_prev":    page > 1,
     })
+
 
 @api_view(["PATCH"])
 @permission_classes([IsAuthenticated])
@@ -716,7 +729,6 @@ def export_leads(request):
                     color="1E293B" if field == "title" else "475569",
                 )
 
-    # Summary rows
     total_rows  = leads.count()
     summary_row = total_rows + 3
     ws.cell(row=summary_row,     column=1, value="Total leads exported:").font = cell_font(bold=True)
@@ -726,7 +738,6 @@ def export_leads(request):
     ws.cell(row=summary_row + 1, column=2,
             value=tz.now().strftime("%Y-%m-%d %H:%M UTC")).font = cell_font()
 
-    # Active filters summary so user knows what they exported
     filters_applied = []
     if request.query_params.get("source"):
         filters_applied.append(f"Source: {request.query_params['source']}")
@@ -763,6 +774,7 @@ def export_leads(request):
     response["Content-Disposition"] = f'attachment; filename="{filename}"'
     return response
 
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_cities(request):
@@ -780,6 +792,7 @@ def get_cities(request):
                 "display": f"{region['name']}, {abbrev}",
             })
     return Response({"cities": cities_data, "total": len(cities_data)})
+
 
 @api_view(["GET"])
 def get_categories(request):

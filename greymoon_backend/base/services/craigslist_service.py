@@ -110,25 +110,23 @@ def _launch_and_guard(
 
 
 def wait_for_run(
-    run_id: str,
-    dataset_id: str = None,
-    source_label: str = "Craigslist",
-    scrape_run_id: int | None = None,
-    log_fn=None,
-    progress_callback=None,
+    run_id, dataset_id=None, source_label="Craigslist",
+    scrape_run_id=None, log_fn=None, progress_callback=None,
 ):
-
-    log        = log_fn or print
-    url        = f"https://api.apify.com/v2/actor-runs/{run_id}"
+    log = log_fn or print
+    url = f"https://api.apify.com/v2/actor-runs/{run_id}"
     poll_count = 0
 
     while True:
+        if _is_cancel_requested(scrape_run_id):
+            _abort_apify_run(run_id)
+            raise Exception(f"[{source_label}] Cancelled by user")
+
         res = requests.get(url, headers=_apify_headers())
         res.raise_for_status()
         status = res.json()["data"]["status"]
         poll_count += 1
 
-        # Live item count every 2 polls (~10s)
         if dataset_id and poll_count % 2 == 0:
             count = _fetch_dataset_count(dataset_id)
             if progress_callback and count > 0:
@@ -142,12 +140,12 @@ def wait_for_run(
         if status in ["FAILED", "ABORTED", "TIMED-OUT"]:
             raise Exception(f"[{source_label}] Actor run {run_id} ended with: {status}")
 
-        if _is_cancel_requested(scrape_run_id):
-            _abort_apify_run(run_id)
-            raise Exception(f"[{source_label}] Cancelled by user")
-
-        time.sleep(POLL_INTERVAL)
-
+        # ← CHANGED: interruptible sleep instead of time.sleep(POLL_INTERVAL)
+        for _ in range(POLL_INTERVAL):
+            if _is_cancel_requested(scrape_run_id):
+                _abort_apify_run(run_id)
+                raise Exception(f"[{source_label}] Cancelled by user")
+            time.sleep(1)
 
 def fetch_dataset(dataset_id: str, limit: int = 1000) -> list[dict]:
     url = (

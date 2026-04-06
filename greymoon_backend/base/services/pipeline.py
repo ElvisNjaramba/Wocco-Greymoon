@@ -8,12 +8,20 @@ from .fb_service import scrape_fb_groups_progressive, upsert_fb_groups
 from .normalizer import normalize_craigslist, normalize_facebook
 from .google_normalizer import normalize_google_serp_page
 from .lead_scorer import calculate_lead_score
+import requests
+from django.conf import settings
 
 GOOGLE_CATEGORY_QUERIES = {
     "cleaning":         "house cleaning service contractor",
     "maintenance":      "home maintenance handyman contractor",
     "waste_management": "junk removal waste management contractor",
 }
+
+
+# ── Sentinel — raised when max_leads is hit ────────────────────
+class LimitReached(Exception):
+    pass
+
 
 def _log(scrape_run_id, stage: str, detail: str, level: str = "info", extra: dict = None):
     ts    = datetime.now(timezone.utc).isoformat()
@@ -77,7 +85,6 @@ def _emit_source_stats(scrape_run_id, source: str, saved: int, skipped: int, bat
 
 
 def _make_progress_callback(scrape_run_id, source_label: str, stats: dict):
-
     def callback(apify_count: int):
         if not scrape_run_id:
             return
@@ -88,13 +95,10 @@ def _make_progress_callback(scrape_run_id, source_label: str, stats: dict):
                 f"~{apify_count} result(s) found by Apify "
                 f"| {already_saved} lead(s) saved to DB so far"
             )
-            ScrapeRun.objects.filter(pk=scrape_run_id).update(
-                stage_detail=detail,
-            )
+            ScrapeRun.objects.filter(pk=scrape_run_id).update(stage_detail=detail)
         except Exception:
             pass
     return callback
-
 
 
 class _ServiceLogger:
@@ -134,17 +138,135 @@ def _cancelled(scrape_run_id) -> bool:
     except Exception:
         return False
 
+def _abort_all_actors(scrape_run_id):
+    if not scrape_run_id:
+        return
 
-def _save_lead_batch(normalized_items, stats, scrape_run_id=None, source_key: str = None):
+    try:
+        from base.models import ScrapeRun
+        import time
+
+        run = ScrapeRun.objects.filter(pk=scrape_run_id).first()
+        if not run:
+            return
+
+        ScrapeRun.objects.filter(pk=scrape_run_id).update(cancel_requested=True)
+
+        headers = {"Authorization": f"Bearer {settings.APIFY_TOKEN}"}
+        aborted_set = set()
+
+        def _abort_ids(ids):
+            for apify_id in ids:
+                try:
+                    requests.post(
+                        f"https://api.apify.com/v2/actor-runs/{apify_id}/abort",
+                        headers=headers,
+                        timeout=10,
+                    )
+                    aborted_set.add(apify_id)
+                except Exception as e:
+                    print(f"[Pipeline] Could not abort actor {apify_id} on limit: {e}")
+
+        def _sweep():
+            newly = []
+            for status_filter in ("RUNNING", "READY"):
+                try:
+                    resp = requests.get(
+                        "https://api.apify.com/v2/actor-runs",
+                        headers=headers,
+                        params={"status": status_filter, "limit": 100},
+                        timeout=15,
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    for actor_run in resp.json().get("data", {}).get("items", []):
+                        aid = actor_run.get("id")
+                        if aid and aid not in aborted_set:
+                            try:
+                                requests.post(
+                                    f"https://api.apify.com/v2/actor-runs/{aid}/abort",
+                                    headers=headers,
+                                    timeout=10,
+                                )
+                                aborted_set.add(aid)
+                                newly.append(aid)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            return newly
+
+        # Abort all currently registered actors
+        _abort_ids(run.apify_run_ids or [])
+
+        # Sweep immediately, then again after short delays to catch late-registered actors
+        _sweep()
+        time.sleep(3)
+
+        # Re-read from DB in case new actors were registered after the first read
+        run.refresh_from_db()
+        _abort_ids([aid for aid in (run.apify_run_ids or []) if aid not in aborted_set])
+        _sweep()
+
+        time.sleep(3)
+        run.refresh_from_db()
+        _abort_ids([aid for aid in (run.apify_run_ids or []) if aid not in aborted_set])
+        _sweep()
+
+    except Exception as e:
+        print(f"[Pipeline] _abort_all_actors error: {e}")
+
+def _finalise_run(scrape_run_id, stats: dict):
+    if not scrape_run_id:
+        return
+    try:
+        from base.models import ScrapeRun
+        ScrapeRun.objects.filter(pk=scrape_run_id).update(
+            status="SUCCEEDED",
+            limit_stop=True,
+            leads_collected=stats["leads_saved"],
+            leads_skipped=stats["leads_skipped"],
+            finished_at=datetime.now(timezone.utc),
+            )
+    except Exception as e:
+        print(f"[Pipeline] Could not finalise run: {e}")
+
+
+def _inc_skipped(stats, source_key):
+    if source_key:
+        stats.setdefault("source_skipped", {})
+        stats["source_skipped"][source_key] = (
+            stats["source_skipped"].get(source_key, 0) + 1
+        )
+
+
+def _save_lead_batch(
+    normalized_items,
+    stats,
+    scrape_run_id=None,
+    source_key: str = None,
+    max_leads: int = 0,
+):
     from base.models import ServiceLead, ScrapeRun
+    import re
+
+    def _norm_title(t: str) -> str:
+        if not t:
+            return ""
+        t = t.lower().strip()
+        t = re.sub(r'[\W_]+', ' ', t)
+        return re.sub(r'\s+', ' ', t).strip()
 
     if not normalized_items:
         return
 
-    incoming_hashes = {i["content_hash"] for i in normalized_items
-                       if i.get("content_hash")}
-    incoming_ids    = {i["post_id"] for i in normalized_items
-                       if i.get("post_id")}
+    if max_leads and stats["leads_saved"] >= max_leads:
+        _abort_all_actors(scrape_run_id)
+        raise LimitReached()
+
+    incoming_hashes = {i["content_hash"] for i in normalized_items if i.get("content_hash")}
+    incoming_ids    = {i["post_id"]       for i in normalized_items if i.get("post_id")}
+    incoming_titles = {_norm_title(i["title"]) for i in normalized_items if i.get("title")}
 
     existing_hashes = set(
         ServiceLead.objects.filter(content_hash__in=incoming_hashes)
@@ -156,24 +278,39 @@ def _save_lead_batch(normalized_items, stats, scrape_run_id=None, source_key: st
         .values_list("post_id", flat=True)
     ) if incoming_ids else set()
 
+    existing_titles: set[str] = set()
+    if incoming_titles:
+        existing_titles = {
+            _norm_title(t)
+            for t in ServiceLead.objects.values_list("title", flat=True)
+            if _norm_title(t) in incoming_titles
+        }
+
     batch_saved_count = 0
 
     for lead_data in normalized_items:
+
+        if max_leads and stats["leads_saved"] >= max_leads:
+            _abort_all_actors(scrape_run_id)
+            raise LimitReached()
+
         try:
             content_hash = lead_data.get("content_hash")
             if content_hash and content_hash in existing_hashes:
                 stats["leads_skipped"] += 1
-                if source_key:
-                    stats.setdefault("source_skipped", {})
-                    stats["source_skipped"][source_key] = stats["source_skipped"].get(source_key, 0) + 1
+                _inc_skipped(stats, source_key)
                 continue
 
             post_id = lead_data.get("post_id")
             if post_id and post_id in existing_ids:
                 stats["leads_skipped"] += 1
-                if source_key:
-                    stats.setdefault("source_skipped", {})
-                    stats["source_skipped"][source_key] = stats["source_skipped"].get(source_key, 0) + 1
+                _inc_skipped(stats, source_key)
+                continue
+
+            norm_t = _norm_title(lead_data.get("title", ""))
+            if norm_t and norm_t in existing_titles:
+                stats["leads_skipped"] += 1
+                _inc_skipped(stats, source_key)
                 continue
 
             score, score_reason = calculate_lead_score(lead_data)
@@ -182,9 +319,7 @@ def _save_lead_batch(normalized_items, stats, scrape_run_id=None, source_key: st
             raw_dt  = lead_data.get("datetime")
             if raw_dt:
                 try:
-                    lead_dt = datetime.fromisoformat(
-                        str(raw_dt).replace("Z", "+00:00")
-                    )
+                    lead_dt = datetime.fromisoformat(str(raw_dt).replace("Z", "+00:00"))
                 except Exception:
                     pass
 
@@ -217,8 +352,12 @@ def _save_lead_batch(normalized_items, stats, scrape_run_id=None, source_key: st
 
             if source_key:
                 stats.setdefault("source_saved", {})
-                stats["source_saved"][source_key] = stats["source_saved"].get(source_key, 0) + 1
+                stats["source_saved"][source_key] = (
+                    stats["source_saved"].get(source_key, 0) + 1
+                )
 
+            if norm_t:
+                existing_titles.add(norm_t)
             if content_hash:
                 existing_hashes.add(content_hash)
             if post_id:
@@ -233,18 +372,29 @@ def _save_lead_batch(normalized_items, stats, scrape_run_id=None, source_key: st
                 except Exception:
                     pass
 
+        except LimitReached:
+            raise
+
         except Exception as e:
-            err_msg = f"Save error for post_id={lead_data.get('post_id','?')[:20]}: {str(e)[:150]}"
+            if "unique_content_hash" in str(e) or "UNIQUE constraint" in str(e):
+                stats["leads_skipped"] += 1
+                _inc_skipped(stats, source_key)
+                continue
+
+            err_msg = (
+                f"Save error for post_id={lead_data.get('post_id','?')[:20]}: "
+                f"{str(e)[:150]}"
+            )
             print(f"[Pipeline] {err_msg}")
             _log(scrape_run_id, "Pipeline — save error", err_msg, level="error")
             stats["errors"].append(err_msg)
 
     if source_key and scrape_run_id and batch_saved_count > 0:
-        src_saved   = stats.get("source_saved", {}).get(source_key, 0)
+        src_saved   = stats.get("source_saved",   {}).get(source_key, 0)
         src_skipped = stats.get("source_skipped", {}).get(source_key, 0)
-        _emit_source_stats(scrape_run_id, source_key, src_saved, src_skipped, batch_saved_count)
-
-
+        _emit_source_stats(
+            scrape_run_id, source_key, src_saved, src_skipped, batch_saved_count
+        )
 
 def _enrich_saved_google_leads(contacts_map: dict, scrape_run_id, log):
     if not contacts_map:
@@ -298,7 +448,6 @@ def _enrich_saved_google_leads(contacts_map: dict, scrape_run_id, log):
         log(f"[Google Website Crawl] Enrichment update error: {e}")
 
 
-
 def _process_and_save_fb_batch(
     chunk_urls,
     fb_batch,
@@ -308,6 +457,7 @@ def _process_and_save_fb_batch(
     chunk_num,
     total_chunks,
     svc_log,
+    max_leads: int = 0,
 ):
     from base.models import ScrapedFbPost
 
@@ -359,7 +509,11 @@ def _process_and_save_fb_batch(
         for item in fresh_items
     ]
 
-    _save_lead_batch(normalized, stats, scrape_run_id, source_key="facebook")
+    # LimitReached bubbles straight up to _run_facebook_pipeline
+    _save_lead_batch(
+        normalized, stats, scrape_run_id,
+        source_key="facebook", max_leads=max_leads,
+    )
 
     new_post_records = []
     for item in fresh_items:
@@ -380,7 +534,7 @@ def _process_and_save_fb_batch(
     if new_post_records:
         ScrapedFbPost.objects.bulk_create(new_post_records, ignore_conflicts=True)
 
-    fb_saved   = stats.get("source_saved", {}).get("facebook", 0)
+    fb_saved   = stats.get("source_saved",   {}).get("facebook", 0)
     fb_skipped = stats.get("source_skipped", {}).get("facebook", 0)
 
     _log(
@@ -390,7 +544,6 @@ def _process_and_save_fb_batch(
         f"{fb_saved} FB leads saved, {fb_skipped} duplicate(s).",
         level="success",
     )
-
 
 
 def run_pipeline(
@@ -403,6 +556,7 @@ def run_pipeline(
     fb_group_urls=None,
     google_max_pages=3,
     google_deep_scrape=True,
+    max_leads: int = 0,          # 0 = unlimited
 ):
     from base.models import ScrapeRun
 
@@ -412,6 +566,7 @@ def run_pipeline(
         "errors":         [],
         "source_saved":   {},
         "source_skipped": {},
+        "limit_stop":     False,
     }
     svc_log = _ServiceLogger(scrape_run_id)
 
@@ -445,6 +600,13 @@ def run_pipeline(
             "No location set — Facebook-only run.", level="info",
         )
 
+    if max_leads:
+        _log(
+            scrape_run_id, "Lead limit set",
+            f"Run will stop automatically after {max_leads} lead(s) are saved.",
+            level="info",
+        )
+
     cl_codes = get_craigslist_codes(categories) if categories else []
     if categories:
         _log(
@@ -452,6 +614,7 @@ def run_pipeline(
             f"{', '.join(categories)} → {len(cl_codes)} CL code(s)",
         )
 
+    # ── Craigslist ─────────────────────────────────────────────
     if "craigslist" in sources and cl_cities and cl_codes:
         total_batches = -(-len(cl_cities) // 3)
         _log(
@@ -506,14 +669,17 @@ def run_pipeline(
                     )
                     for item in fresh
                 ]
-                _save_lead_batch(normalized, stats, scrape_run_id, source_key="craigslist")
+                _save_lead_batch(
+                    normalized, stats, scrape_run_id,
+                    source_key="craigslist", max_leads=max_leads,
+                )
 
                 for item in fresh:
                     pid = str(item.get("id") or "")
                     if pid:
                         existing_cl_ids.add(pid)
 
-                cl_saved   = stats.get("source_saved", {}).get("craigslist", 0)
+                cl_saved   = stats.get("source_saved",   {}).get("craigslist", 0)
                 cl_skipped = stats.get("source_skipped", {}).get("craigslist", 0)
 
                 _log(
@@ -532,6 +698,18 @@ def run_pipeline(
                 level="success",
             )
 
+        except LimitReached:
+            _log(
+                scrape_run_id, "Craigslist — limit reached",
+                f"max_leads={max_leads} reached after "
+                f"{stats['leads_saved']} lead(s) — stopping.",
+                level="success",
+            )
+            stats["limit_stop"] = True
+            _abort_all_actors(scrape_run_id) 
+            _finalise_run(scrape_run_id, stats)
+            return stats
+
         except Exception as e:
             _log(scrape_run_id, "Craigslist — error", str(e), level="error")
             stats["errors"].append(f"Craigslist: {str(e)}")
@@ -543,6 +721,7 @@ def run_pipeline(
             level="warning",
         )
 
+    # ── Facebook ───────────────────────────────────────────────
     if "facebook" in sources:
         manual_group_urls = [u.strip() for u in (fb_group_urls or []) if u.strip()]
 
@@ -558,14 +737,28 @@ def run_pipeline(
                 "Cancelled before Facebook could start.", level="warning",
             )
         else:
-            _run_facebook_pipeline(
-                manual_group_urls=manual_group_urls,
-                max_posts_per_group=max_posts_per_group,
-                stats=stats,
-                scrape_run_id=scrape_run_id,
-                svc_log=svc_log,
-            )
+            try:
+                _run_facebook_pipeline(
+                    manual_group_urls=manual_group_urls,
+                    max_posts_per_group=max_posts_per_group,
+                    stats=stats,
+                    scrape_run_id=scrape_run_id,
+                    svc_log=svc_log,
+                    max_leads=max_leads,
+                )
+            except LimitReached:
+                _log(
+                    scrape_run_id, "Facebook — limit reached",
+                    f"max_leads={max_leads} reached after "
+                    f"{stats['leads_saved']} lead(s) — stopping.",
+                    level="success",
+                )
+                stats["limit_stop"] = True
+                _abort_all_actors(scrape_run_id) 
+                _finalise_run(scrape_run_id, stats)
+                return stats
 
+    # ── Google ─────────────────────────────────────────────────
     if "google" in sources:
         if not location_data:
             _log(
@@ -579,16 +772,30 @@ def run_pipeline(
                 "Cancelled before Google Search could start.", level="warning",
             )
         else:
-            _run_google_pipeline(
-                categories=categories,
-                location_data=location_data,
-                google_max_pages=google_max_pages,
-                google_deep_scrape=google_deep_scrape,
-                stats=stats,
-                scrape_run_id=scrape_run_id,
-                svc_log=svc_log,
-            )
+            try:
+                _run_google_pipeline(
+                    categories=categories,
+                    location_data=location_data,
+                    google_max_pages=google_max_pages,
+                    google_deep_scrape=google_deep_scrape,
+                    stats=stats,
+                    scrape_run_id=scrape_run_id,
+                    svc_log=svc_log,
+                    max_leads=max_leads,
+                )
+            except LimitReached:
+                _log(
+                    scrape_run_id, "Google Search — limit reached",
+                    f"max_leads={max_leads} reached after "
+                    f"{stats['leads_saved']} lead(s) — stopping.",
+                    level="success",
+                )
+                stats["limit_stop"] = True
+                _abort_all_actors(scrape_run_id) 
+                _finalise_run(scrape_run_id, stats)
+                return stats
 
+    # ── Finalise ───────────────────────────────────────────────
     if scrape_run_id:
         try:
             run = ScrapeRun.objects.get(pk=scrape_run_id)
@@ -598,7 +805,10 @@ def run_pipeline(
             run.leads_skipped   = stats["leads_skipped"]
             run.finished_at     = datetime.now(timezone.utc)
             run.source_stats = {
-                k: {"saved": v, "skipped": stats.get("source_skipped", {}).get(k, 0)}
+                k: {
+                    "saved":   v,
+                    "skipped": stats.get("source_skipped", {}).get(k, 0),
+                }
                 for k, v in stats.get("source_saved", {}).items()
             }
             run.save()
@@ -616,6 +826,7 @@ def run_pipeline(
     )
     return stats
 
+
 def _run_facebook_pipeline(
     *,
     manual_group_urls,
@@ -623,6 +834,7 @@ def _run_facebook_pipeline(
     stats,
     scrape_run_id,
     svc_log,
+    max_leads: int = 0,
 ):
     all_group_urls: list[str] = []
     seen: set[str] = set()
@@ -660,70 +872,67 @@ def _run_facebook_pipeline(
     total_chunks = -(-len(all_group_urls) // 5)
     chunk_num    = 0
 
-    try:
-        for batch_posts in scrape_fb_groups_progressive(
-            group_urls=all_group_urls,
-            max_posts_per_group=max_posts_per_group,
-            scrape_run_id=scrape_run_id,
-            log=svc_log,
-            progress_callback=_make_progress_callback(
-                scrape_run_id, "Facebook", stats
-            ),
-        ):
-            chunk_num += 1
+    for batch_posts in scrape_fb_groups_progressive(
+        group_urls=all_group_urls,
+        max_posts_per_group=max_posts_per_group,
+        scrape_run_id=scrape_run_id,
+        log=svc_log,
+        progress_callback=_make_progress_callback(
+            scrape_run_id, "Facebook", stats
+        ),
+    ):
+        chunk_num += 1
 
-            if not batch_posts:
-                _log(
-                    scrape_run_id,
-                    f"Facebook — chunk {chunk_num} empty",
-                    "Actor returned no posts for this batch.",
-                    level="warning",
-                )
-                continue
-
-            chunk_urls_set: set[str] = set()
-            for post in batch_posts:
-                g_url = (
-                    post.get("inputUrl")
-                    or post.get("facebookUrl")
-                    or ""
-                ).rstrip("/") + "/"
-                if g_url and g_url != "/":
-                    chunk_urls_set.add(g_url)
-            chunk_urls = list(chunk_urls_set) if chunk_urls_set else all_group_urls
-
-            _process_and_save_fb_batch(
-                chunk_urls=chunk_urls,
-                fb_batch=batch_posts,
-                stats=stats,
-                scrape_run_id=scrape_run_id,
-                group_name_map=group_name_map,
-                chunk_num=chunk_num,
-                total_chunks=total_chunks,
-                svc_log=svc_log,
+        if not batch_posts:
+            _log(
+                scrape_run_id,
+                f"Facebook — chunk {chunk_num} empty",
+                "Actor returned no posts for this batch.",
+                level="warning",
             )
+            continue
 
-            if _cancelled(scrape_run_id):
-                fb_saved = stats.get("source_saved", {}).get("facebook", 0)
-                _log(
-                    scrape_run_id, "Facebook — cancelled",
-                    f"Cancelled after chunk {chunk_num}. "
-                    f"{fb_saved} FB lead(s) saved.",
-                    level="warning",
-                )
-                return
+        chunk_urls_set: set[str] = set()
+        for post in batch_posts:
+            g_url = (
+                post.get("inputUrl")
+                or post.get("facebookUrl")
+                or ""
+            ).rstrip("/") + "/"
+            if g_url and g_url != "/":
+                chunk_urls_set.add(g_url)
+        chunk_urls = list(chunk_urls_set) if chunk_urls_set else all_group_urls
 
-        fb_saved = stats.get("source_saved", {}).get("facebook", 0)
-        _log(
-            scrape_run_id, "Facebook — complete",
-            f"All {chunk_num} chunk(s) processed. "
-            f"{fb_saved} FB lead(s) saved.",
-            level="success",
+        # LimitReached bubbles up to run_pipeline
+        _process_and_save_fb_batch(
+            chunk_urls=chunk_urls,
+            fb_batch=batch_posts,
+            stats=stats,
+            scrape_run_id=scrape_run_id,
+            group_name_map=group_name_map,
+            chunk_num=chunk_num,
+            total_chunks=total_chunks,
+            svc_log=svc_log,
+            max_leads=max_leads,
         )
 
-    except Exception as e:
-        _log(scrape_run_id, "Facebook — error", str(e), level="error")
-        stats["errors"].append(f"Facebook: {str(e)}")
+        if _cancelled(scrape_run_id):
+            fb_saved = stats.get("source_saved", {}).get("facebook", 0)
+            _log(
+                scrape_run_id, "Facebook — cancelled",
+                f"Cancelled after chunk {chunk_num}. "
+                f"{fb_saved} FB lead(s) saved.",
+                level="warning",
+            )
+            return
+
+    fb_saved = stats.get("source_saved", {}).get("facebook", 0)
+    _log(
+        scrape_run_id, "Facebook — complete",
+        f"All {chunk_num} chunk(s) processed. "
+        f"{fb_saved} FB lead(s) saved.",
+        level="success",
+    )
 
 
 def _run_google_pipeline(
@@ -735,6 +944,7 @@ def _run_google_pipeline(
     stats,
     scrape_run_id,
     svc_log,
+    max_leads: int = 0,
 ):
     try:
         from base.models import ServiceLead
@@ -770,109 +980,108 @@ def _run_google_pipeline(
     )
 
     query_num = 0
-    try:
-        for result_bundle in scrape_google_search_progressive(
-            queries=google_queries,
-            location=google_location,
-            max_pages=google_max_pages,
-            enrich_leads=True,
-            deep_scrape_sites=google_deep_scrape,
-            scrape_run_id=scrape_run_id,
-            _log_fn=svc_log,
-            enrich_callback=lambda cm: _enrich_saved_google_leads(
-                cm, scrape_run_id, svc_log
-            ),
-            progress_callback=_make_progress_callback(
-                scrape_run_id, "Google", stats
-            ),
-        ):
-            query_num += 1
+    for result_bundle in scrape_google_search_progressive(
+        queries=google_queries,
+        location=google_location,
+        max_pages=google_max_pages,
+        enrich_leads=True,
+        deep_scrape_sites=google_deep_scrape,
+        scrape_run_id=scrape_run_id,
+        _log_fn=svc_log,
+        enrich_callback=lambda cm: _enrich_saved_google_leads(
+            cm, scrape_run_id, svc_log
+        ),
+        progress_callback=_make_progress_callback(
+            scrape_run_id, "Google", stats
+        ),
+    ):
+        query_num += 1
 
-            serp_pages   = result_bundle.get("serp_pages", [])
-            contacts_map = result_bundle.get("contacts_map", {})
+        serp_pages   = result_bundle.get("serp_pages", [])
+        contacts_map = result_bundle.get("contacts_map", {})
 
-            all_leads = []
-            for page in serp_pages:
-                page_leads = normalize_google_serp_page(
-                    page,
-                    categories[0] if categories else "general",
-                    google_location,
-                    contacts_map=contacts_map,
-                )
-                for lead in page_leads:
-                    url = lead.get("url", "")
-                    if url and url in existing_google_urls:
-                        stats["leads_skipped"] += 1
-                        stats.setdefault("source_skipped", {})
-                        stats["source_skipped"]["google"] = (
-                            stats["source_skipped"].get("google", 0) + 1
-                        )
-                        continue
-                    all_leads.append(lead)
-                    if url:
-                        existing_google_urls.add(url)
+        all_leads = []
+        for page in serp_pages:
+            page_leads = normalize_google_serp_page(
+                page,
+                categories[0] if categories else "general",
+                google_location,
+                contacts_map=contacts_map,
+            )
+            for lead in page_leads:
+                url = lead.get("url", "")
+                if url and url in existing_google_urls:
+                    stats["leads_skipped"] += 1
+                    stats.setdefault("source_skipped", {})
+                    stats["source_skipped"]["google"] = (
+                        stats["source_skipped"].get("google", 0) + 1
+                    )
+                    continue
+                all_leads.append(lead)
+                if url:
+                    existing_google_urls.add(url)
 
-            if not all_leads:
-                _log(
-                    scrape_run_id,
-                    f"Google Search — query {query_num} empty",
-                    "No new leads extracted from SERP pages.",
-                    level="warning",
-                )
-                continue
-
+        if not all_leads:
             _log(
                 scrape_run_id,
-                f"Google Search — query {query_num} saving",
-                f"{len(all_leads)} new lead(s) from "
-                f"{len(serp_pages)} SERP page(s). Saving now…",
-            )
-
-            _save_lead_batch(all_leads, stats, scrape_run_id, source_key="google")
-
-            gg_saved   = stats.get("source_saved", {}).get("google", 0)
-            gg_skipped = stats.get("source_skipped", {}).get("google", 0)
-
-            _log(
-                scrape_run_id,
-                f"Google Search — query {query_num} saved",
-                f"{len(all_leads)} processed — "
-                f"{gg_saved} GG leads saved, "
-                f"{gg_skipped} duplicate(s).",
-                level="success",
-            )
-
-            if contacts_map:
-                _enrich_saved_google_leads(contacts_map, scrape_run_id, svc_log)
-
-            if _cancelled(scrape_run_id):
-                _log(
-                    scrape_run_id, "Google Search — cancelled",
-                    f"Cancelled after query {query_num}. "
-                    f"{gg_saved} GG lead(s) saved so far.",
-                    level="warning",
-                )
-                return
-
-        if query_num > 0:
-            gg_saved = stats.get("source_saved", {}).get("google", 0)
-            _log(
-                scrape_run_id, "Google Search — complete",
-                f"All {query_num} "
-                f"quer{'y' if query_num == 1 else 'ies'} done. "
-                f"{gg_saved} GG lead(s) saved.",
-                level="success",
-            )
-        else:
-            _log(
-                scrape_run_id, "Google Search — no results",
-                "Actor returned 0 results for all queries.",
+                f"Google Search — query {query_num} empty",
+                "No new leads extracted from SERP pages.",
                 level="warning",
             )
+            continue
 
-    except Exception as e:
-        _log(scrape_run_id, "Google Search — error", str(e), level="error")
-        stats["errors"].append(f"Google Search: {str(e)}")
+        _log(
+            scrape_run_id,
+            f"Google Search — query {query_num} saving",
+            f"{len(all_leads)} new lead(s) from "
+            f"{len(serp_pages)} SERP page(s). Saving now…",
+        )
+
+        # LimitReached bubbles up to run_pipeline
+        _save_lead_batch(
+            all_leads, stats, scrape_run_id,
+            source_key="google", max_leads=max_leads,
+        )
+
+        gg_saved   = stats.get("source_saved",   {}).get("google", 0)
+        gg_skipped = stats.get("source_skipped", {}).get("google", 0)
+
+        _log(
+            scrape_run_id,
+            f"Google Search — query {query_num} saved",
+            f"{len(all_leads)} processed — "
+            f"{gg_saved} GG leads saved, "
+            f"{gg_skipped} duplicate(s).",
+            level="success",
+        )
+
+        if contacts_map:
+            _enrich_saved_google_leads(contacts_map, scrape_run_id, svc_log)
+
+        if _cancelled(scrape_run_id):
+            _log(
+                scrape_run_id, "Google Search — cancelled",
+                f"Cancelled after query {query_num}. "
+                f"{gg_saved} GG lead(s) saved so far.",
+                level="warning",
+            )
+            return
+
+    if query_num > 0:
+        gg_saved = stats.get("source_saved", {}).get("google", 0)
+        _log(
+            scrape_run_id, "Google Search — complete",
+            f"All {query_num} "
+            f"quer{'y' if query_num == 1 else 'ies'} done. "
+            f"{gg_saved} GG lead(s) saved.",
+            level="success",
+        )
+    else:
+        _log(
+            scrape_run_id, "Google Search — no results",
+            "Actor returned 0 results for all queries.",
+            level="warning",
+        )
 
 
 def _mark_run_failed(scrape_run_id, reason: str):

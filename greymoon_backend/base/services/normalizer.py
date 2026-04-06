@@ -60,12 +60,23 @@ def normalize_craigslist(item: dict, service_category: str) -> dict:
     }
 
     normalized["content_hash"] = _content_hash({
-        "title": title,
-        "post":  description,
-        "url":   url,
+        "title_norm": _normalize_title(title),
+        "post":  description[:300],   # remove url from hash — url varies, content doesn't
     })
 
     return normalized
+
+
+import re
+
+def _normalize_title(title: str) -> str:
+    """Lowercase, strip punctuation/whitespace for fuzzy title comparison."""
+    if not title:
+        return ""
+    t = title.lower().strip()
+    t = re.sub(r'[\W_]+', ' ', t)   # replace non-alphanumeric with space
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
 
 def normalize_facebook(
     item: dict,
@@ -146,11 +157,9 @@ def normalize_facebook(
     }
 
     normalized["content_hash"] = _content_hash({
-        "title": title,
-        "post":  text,
-        "url":   post_url,
+        "title_norm": _normalize_title(title),
+        "post":  text[:300],
     })
-
     return normalized
 
 

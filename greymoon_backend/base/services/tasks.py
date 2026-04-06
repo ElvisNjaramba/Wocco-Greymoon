@@ -11,6 +11,7 @@ def start_pipeline_thread(
     fb_group_urls=None,
     google_max_pages=3,
     google_deep_scrape=True,
+    max_leads=0,
 ):
     def _run():
         run_pipeline(
@@ -23,6 +24,7 @@ def start_pipeline_thread(
             fb_group_urls=fb_group_urls or [],
             google_max_pages=google_max_pages,
             google_deep_scrape=google_deep_scrape,
+            max_leads=max_leads,
         )
 
     t = threading.Thread(target=_run, daemon=True)

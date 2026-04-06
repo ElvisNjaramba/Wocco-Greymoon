@@ -63,6 +63,14 @@ class ServiceLead(models.Model):
             models.Index(fields=["service_category"]),
             models.Index(fields=["score"]),
             models.Index(fields=["fb_group_name"]),
+            models.Index(fields=["title"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["content_hash"],
+                condition=models.Q(content_hash__isnull=False) & ~models.Q(content_hash=""),
+                name="unique_content_hash_nonempty",
+            )
         ]
 
 
@@ -94,6 +102,8 @@ class ScrapeRun(models.Model):
     source_stats = models.JSONField(default=dict, blank=True)
 
     max_posts_per_group = models.IntegerField(default=50)
+    max_leads    = models.IntegerField(default=0)   # 0 = no limit
+    limit_stop   = models.BooleanField(default=False)
 
     google_max_pages   = models.IntegerField(default=3)
     google_deep_scrape = models.BooleanField(default=True)

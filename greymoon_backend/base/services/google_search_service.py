@@ -223,6 +223,11 @@ def _run_crawl_parallel(
     scrape_run_id,
     log,
 ):
+    if _is_cancel_requested(scrape_run_id):
+        log("[Google Website Crawl] Cancelled before crawl started — exiting")
+        crawl_done.set()
+        return
+
     total = len(urls_to_crawl)
     log(
         f"[Google Website Crawl] Starting crawler on {total} contractor site(s) "
@@ -304,7 +309,11 @@ def _run_crawl_parallel(
                         f"[Google Website Crawl] Batch {b_idx+1} still running "
                         f"({elapsed}s elapsed, status: {status})..."
                     )
-                time.sleep(POLL_INTERVAL)
+
+            for _ in range(POLL_INTERVAL):
+                if _is_cancel_requested(scrape_run_id):
+                    break
+                time.sleep(1)
 
         try:
             pages = _fetch_dataset(dataset_id)
@@ -370,6 +379,7 @@ def _run_crawl_parallel(
     )
     crawl_done.set()
 
+
 def scrape_google_search_progressive(
     queries: list[str],
     location: str,
@@ -381,7 +391,6 @@ def scrape_google_search_progressive(
     enrich_callback=None,
     progress_callback=None,
 ):
-
     log = _log_fn or print
 
     for i, query in enumerate(queries):
@@ -415,7 +424,6 @@ def scrape_google_search_progressive(
         serp_run_id, serp_dataset_id = serp_result
         log(f"[Google Search] SERP actor launched (run {serp_run_id}) — waiting for results...")
 
-        # ── Poll SERP with live count updates ─────────────────
         serp_pages = []
         serp_poll  = 0
         serp_ok    = False
@@ -436,12 +444,14 @@ def scrape_google_search_progressive(
                 status = _poll_run_status(serp_run_id)
             except Exception as e:
                 log(f"[Google Search] SERP status check error: {e} — retrying...")
-                time.sleep(POLL_INTERVAL)
+                for _ in range(POLL_INTERVAL):
+                    if _is_cancel_requested(scrape_run_id):
+                        break
+                    time.sleep(1)
                 continue
 
             serp_poll += 1
 
-            # Live item count every 2 polls (~10s)
             if serp_poll % 2 == 0:
                 count = _fetch_dataset_count(serp_dataset_id)
                 if count > 0 and progress_callback:
@@ -459,7 +469,10 @@ def scrape_google_search_progressive(
                 log(f"[Google Search] SERP actor ended with: {status}")
                 break
 
-            time.sleep(POLL_INTERVAL)
+            for _ in range(POLL_INTERVAL):
+                if _is_cancel_requested(scrape_run_id):
+                    break
+                time.sleep(1)
 
         try:
             serp_pages = _fetch_dataset(serp_dataset_id)
@@ -560,3 +573,7 @@ def scrape_google_search_progressive(
                 enrich_callback(final_snapshot)
             except Exception as e:
                 log(f"[Google Search] Final enrich callback error: {e}")
+
+
+
+

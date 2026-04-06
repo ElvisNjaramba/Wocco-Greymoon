@@ -7,8 +7,6 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-# Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = 'django-insecure-rpw3@rl9&_yf5c08%s+4(xakzv4qj$5wjl++x2v&wyl&)!u#n*'
@@ -16,7 +14,7 @@ SECRET_KEY = 'django-insecure-rpw3@rl9&_yf5c08%s+4(xakzv4qj$5wjl++x2v&wyl&)!u#n*
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ["*"]
 
 
 # Application definition
@@ -53,12 +51,12 @@ load_dotenv()
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
+    "https://wocco-greymoon.vercel.app",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
+    "https://wocco-greymoon.vercel.app",
+    "https://wocco-greymoon.vercel.app",
 ]
 # CORS_ALLOW_ALL_ORIGINS = True
 
@@ -74,8 +72,8 @@ REST_FRAMEWORK = {
 }
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=5),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=30),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
     'ROTATE_REFRESH_TOKENS': True,
     'BLACKLIST_AFTER_ROTATION': True,
     'AUTH_HEADER_TYPES': ('Bearer',),

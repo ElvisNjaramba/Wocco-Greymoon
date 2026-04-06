@@ -106,9 +106,8 @@ def _build_lead(
         },
     }
     normalized["content_hash"] = _content_hash({
-        "url":   url,
-        "title": title,
-        "post":  post_body[:300],
+        "title_norm": _normalize_title(title),
+        "post":  description[:300],   # remove url from hash — url varies, content doesn't
     })
     return normalized
 

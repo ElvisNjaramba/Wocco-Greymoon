@@ -116,12 +116,16 @@ def _poll_until_done(
             status = res.json()["data"]["status"]
         except Exception as e:
             log(f"[{label}] Status check error: {e} — retrying")
-            time.sleep(POLL_INTERVAL)
+            for _ in range(POLL_INTERVAL):
+                if _is_cancel_requested(scrape_run_id):
+                    _abort_apify_run(run_id)
+                    log(f"[{label}] Cancelled during retry wait — run {run_id} aborted")
+                    return "ABORTED"
+                time.sleep(1)
             continue
 
         poll_count += 1
 
-        # Live item count every 2 polls (~10s)
         if dataset_id and poll_count % 2 == 0:
             count = _fetch_dataset_count(dataset_id)
             if progress_callback and count > 0:
@@ -137,8 +141,12 @@ def _poll_until_done(
             log(f"[{label}] Actor run {run_id} ended with: {status}")
             return status
 
-        time.sleep(POLL_INTERVAL)
-
+        for _ in range(POLL_INTERVAL):
+            if _is_cancel_requested(scrape_run_id):
+                _abort_apify_run(run_id)
+                log(f"[{label}] Cancelled by user — run {run_id} aborted")
+                return "ABORTED"
+            time.sleep(1)
 
 def _fetch_dataset(dataset_id: str, limit: int = 1000) -> list[dict]:
     resp = requests.get(
