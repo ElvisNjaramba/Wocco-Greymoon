@@ -113,34 +113,45 @@ def wait_for_run(
     run_id, dataset_id=None, source_label="Craigslist",
     scrape_run_id=None, log_fn=None, progress_callback=None,
 ):
+    import time, requests
+    from django.conf import settings
+ 
     log = log_fn or print
     url = f"https://api.apify.com/v2/actor-runs/{run_id}"
     poll_count = 0
-
+ 
     while True:
+        # ── Cancel / limit check ──────────────────────────────
         if _is_cancel_requested(scrape_run_id):
             _abort_apify_run(run_id)
             raise Exception(f"[{source_label}] Cancelled by user")
-
+ 
         res = requests.get(url, headers=_apify_headers())
         res.raise_for_status()
         status = res.json()["data"]["status"]
         poll_count += 1
-
+ 
         if dataset_id and poll_count % 2 == 0:
             count = _fetch_dataset_count(dataset_id)
             if progress_callback and count > 0:
                 progress_callback(count)
+ 
+            # ── FIX: re-check cancel immediately after callback ──
+            if _is_cancel_requested(scrape_run_id):
+                _abort_apify_run(run_id)
+                raise Exception(f"[{source_label}] Cancelled by user")
+ 
             log(f"[{source_label}] Status: {status} | ~{count} item(s) in Apify dataset so far")
         else:
             log(f"[{source_label}] Actor status: {status}")
-
+ 
         if status == "SUCCEEDED":
             return
+ 
         if status in ["FAILED", "ABORTED", "TIMED-OUT"]:
             raise Exception(f"[{source_label}] Actor run {run_id} ended with: {status}")
-
-        # ← CHANGED: interruptible sleep instead of time.sleep(POLL_INTERVAL)
+ 
+        # Interruptible sleep
         for _ in range(POLL_INTERVAL):
             if _is_cancel_requested(scrape_run_id):
                 _abort_apify_run(run_id)

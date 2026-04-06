@@ -98,14 +98,16 @@ def _poll_until_done(
     log=None,
     progress_callback=None,
 ) -> str:
-
+    import time, requests
+ 
     poll_count = 0
+ 
     while True:
         if _is_cancel_requested(scrape_run_id):
             _abort_apify_run(run_id)
-            log(f"[{label}] Cancelled by user — run {run_id} aborted")
+            log(f"[{label}] Cancelled by user --- run {run_id} aborted")
             return "ABORTED"
-
+ 
         try:
             res = requests.get(
                 f"https://api.apify.com/v2/actor-runs/{run_id}",
@@ -115,39 +117,46 @@ def _poll_until_done(
             res.raise_for_status()
             status = res.json()["data"]["status"]
         except Exception as e:
-            log(f"[{label}] Status check error: {e} — retrying")
+            log(f"[{label}] Status check error: {e} --- retrying")
             for _ in range(POLL_INTERVAL):
                 if _is_cancel_requested(scrape_run_id):
                     _abort_apify_run(run_id)
-                    log(f"[{label}] Cancelled during retry wait — run {run_id} aborted")
+                    log(f"[{label}] Cancelled during retry wait --- run {run_id} aborted")
                     return "ABORTED"
                 time.sleep(1)
             continue
-
+ 
         poll_count += 1
-
+ 
         if dataset_id and poll_count % 2 == 0:
             count = _fetch_dataset_count(dataset_id)
             if progress_callback and count > 0:
                 progress_callback(count)
+ 
+            # ── FIX: re-check cancel immediately after callback ──
+            if _is_cancel_requested(scrape_run_id):
+                _abort_apify_run(run_id)
+                log(f"[{label}] Cancelled by user --- run {run_id} aborted")
+                return "ABORTED"
+ 
             if poll_count % 4 == 0:
-                log(f"[{label}] Still running ({poll_count * POLL_INTERVAL}s) | ~{count} post(s) found so far…")
+                log(f"[{label}] Still running ({poll_count * POLL_INTERVAL}s) | ~{count} post(s) found so far...")
         elif poll_count % 4 == 0:
-            log(f"[{label}] Still running ({poll_count * POLL_INTERVAL}s)…")
-
+            log(f"[{label}] Still running ({poll_count * POLL_INTERVAL}s)...")
+ 
         if status == "SUCCEEDED":
             return "SUCCEEDED"
+ 
         if status in ("FAILED", "ABORTED", "TIMED-OUT"):
             log(f"[{label}] Actor run {run_id} ended with: {status}")
             return status
-
+ 
         for _ in range(POLL_INTERVAL):
             if _is_cancel_requested(scrape_run_id):
                 _abort_apify_run(run_id)
-                log(f"[{label}] Cancelled by user — run {run_id} aborted")
+                log(f"[{label}] Cancelled by user --- run {run_id} aborted")
                 return "ABORTED"
             time.sleep(1)
-
 def _fetch_dataset(dataset_id: str, limit: int = 1000) -> list[dict]:
     resp = requests.get(
         f"https://api.apify.com/v2/datasets/{dataset_id}"

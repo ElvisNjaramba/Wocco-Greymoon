@@ -430,7 +430,7 @@ def scrape_google_search_progressive(
 
         while True:
             if _is_cancel_requested(scrape_run_id):
-                log("[Google Search] Cancel detected — aborting SERP run")
+                log("[Google Search] Cancel detected --- aborting SERP run")
                 _abort_apify_run(serp_run_id)
                 try:
                     serp_pages = _fetch_dataset(serp_dataset_id)
@@ -439,41 +439,53 @@ def scrape_google_search_progressive(
                 if serp_pages:
                     yield {"serp_pages": serp_pages, "contacts_map": {}}
                 return
-
+ 
             try:
                 status = _poll_run_status(serp_run_id)
             except Exception as e:
-                log(f"[Google Search] SERP status check error: {e} — retrying...")
+                log(f"[Google Search] SERP status check error: {e} --- retrying...")
                 for _ in range(POLL_INTERVAL):
                     if _is_cancel_requested(scrape_run_id):
                         break
                     time.sleep(1)
                 continue
-
+ 
             serp_poll += 1
-
+ 
             if serp_poll % 2 == 0:
                 count = _fetch_dataset_count(serp_dataset_id)
                 if count > 0 and progress_callback:
                     progress_callback(count)
+ 
+                # ── FIX: re-check cancel immediately after callback ──
+                if _is_cancel_requested(scrape_run_id):
+                    log("[Google Search] Cancel detected after progress callback --- aborting SERP run")
+                    _abort_apify_run(serp_run_id)
+                    try:
+                        serp_pages = _fetch_dataset(serp_dataset_id)
+                    except Exception:
+                        pass
+                    if serp_pages:
+                        yield {"serp_pages": serp_pages, "contacts_map": {}}
+                    return
+ 
                 if serp_poll % 4 == 0:
                     log(
-                        f"[Google Search] SERP running ({serp_poll * POLL_INTERVAL}s) — "
-                        f"~{count} SERP page(s) collected so far…"
+                        f"[Google Search] SERP running ({serp_poll * POLL_INTERVAL}s) --- "
+                        f"~{count} SERP page(s) collected so far..."
                     )
-
+ 
             if status == "SUCCEEDED":
                 serp_ok = True
                 break
             elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
                 log(f"[Google Search] SERP actor ended with: {status}")
                 break
-
+ 
             for _ in range(POLL_INTERVAL):
                 if _is_cancel_requested(scrape_run_id):
                     break
                 time.sleep(1)
-
         try:
             serp_pages = _fetch_dataset(serp_dataset_id)
         except Exception as e:

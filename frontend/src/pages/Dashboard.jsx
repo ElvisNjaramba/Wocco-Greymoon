@@ -368,9 +368,21 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
   const serverSaved  = scrapeStatus?.leads_collected || 0;
   const skipped      = scrapeStatus?.leads_skipped   || 0;
   const sources      = scrapeStatus?.sources || [];
+  const maxLeads     = scrapeStatus?.max_leads || 0;
+  const isStopping   = isAborting || scrapeStatus?.is_stopping || scrapeStatus?.cancel_requested || false;
+
   const activeSrc    = stageSource(currentStage);
   const activeFamily = sourceFamily(activeSrc);
   const activeCfg    = SOURCE_CFG[activeFamily?.toUpperCase()];
+
+  // ── Parse Apify raw count from stage_detail string ──────────────────
+  const apifyItemCount = useMemo(() => {
+    const match = stageDetail.match(/~(\d+)\s+result/i);
+    return match ? parseInt(match[1], 10) : 0;
+  }, [stageDetail]);
+
+  // ── Best DB-saved count: prefer serverSaved (now updated live by backend) ──
+  const displayCount = Math.max(liveLeadCount ?? 0, serverSaved);
 
   const sourceStats = useMemo(() => {
     if (scrapeStatus?.source_stats && Object.keys(scrapeStatus.source_stats).length > 0) {
@@ -379,15 +391,30 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
     return parseSourceStatsFromLog(scrapeStatus?.activity_log);
   }, [scrapeStatus?.source_stats, scrapeStatus?.activity_log]);
 
-  const displayCount = Math.max(liveLeadCount ?? 0, serverSaved);
   useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [log.length]);
+
   const [elapsed, setElapsed] = useState(0);
   const startTs = scrapeStatus?.started_at ? new Date(scrapeStatus.started_at) : new Date();
-  useEffect(() => { const iv = setInterval(() => setElapsed(Math.floor((Date.now() - startTs) / 1000)), 1000); return () => clearInterval(iv); }, [scrapeStatus?.started_at]);
+  useEffect(() => {
+    const iv = setInterval(() => setElapsed(Math.floor((Date.now() - startTs) / 1000)), 1000);
+    return () => clearInterval(iv);
+  }, [scrapeStatus?.started_at]);
   const fmtElapsed = `${String(Math.floor(elapsed / 60)).padStart(2, "0")}:${String(elapsed % 60).padStart(2, "0")}`;
 
-  const heroBorder = isAborting ? "border-red-500/30 bg-gradient-to-br from-red-950/30 to-[#0f1117]" : activeCfg ? activeCfg.hero : "border-blue-500/20 bg-gradient-to-br from-slate-900/60 to-[#0f1117]";
-  const heroLine   = isAborting ? "bg-red-500/50" : activeCfg ? activeCfg.line : "bg-gradient-to-r from-transparent via-blue-400/60 to-transparent animate-pulse";
+  // ── Lead limit progress ──────────────────────────────────────────────
+  const limitPct = maxLeads > 0 ? Math.min(100, Math.round((displayCount / maxLeads) * 100)) : 0;
+
+  const heroBorder = isStopping
+    ? "border-red-500/30 bg-gradient-to-br from-red-950/30 to-[#0f1117]"
+    : activeCfg
+    ? activeCfg.hero
+    : "border-blue-500/20 bg-gradient-to-br from-slate-900/60 to-[#0f1117]";
+
+  const heroLine = isStopping
+    ? "bg-red-500/50"
+    : activeCfg
+    ? activeCfg.line
+    : "bg-gradient-to-r from-transparent via-blue-400/60 to-transparent animate-pulse";
 
   const isDone    = (src) => log.some(e => e.stage?.toLowerCase().includes(`${src} — complete`) || e.stage?.toLowerCase().includes(`${src} — skipped`));
   const isStarted = (src) => log.some(e => e.stage?.toLowerCase().includes(src));
@@ -397,40 +424,63 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
     <div className="space-y-3">
       <div className={`relative overflow-hidden rounded-2xl border transition-all duration-500 ${heroBorder}`}>
         <div className={`h-[2px] w-full transition-all duration-500 ${heroLine}`} />
+
         <div className="px-4 py-4 lg:px-6 lg:py-5">
+
+          {/* ── Header row: icon + stage + stop button ── */}
           <div className="flex items-start justify-between gap-3 mb-4">
             <div className="flex items-start gap-3 min-w-0">
               <div className="flex-shrink-0">
-                {isAborting ? (
-                  <div className="w-9 h-9 rounded-full bg-red-500/15 border border-red-500/30 flex items-center justify-center"><X className="w-4 h-4 text-red-400" /></div>
+                {isStopping ? (
+                  <div className="w-9 h-9 rounded-full bg-red-500/15 border border-red-500/30 flex items-center justify-center">
+                    <X className="w-4 h-4 text-red-400" />
+                  </div>
                 ) : activeCfg ? (
                   <div className="relative w-9 h-9">
                     <div className={`absolute inset-0 rounded-full animate-ping opacity-30 ${activeCfg.pillIdle}`} />
-                    <div className={`relative w-9 h-9 rounded-full flex items-center justify-center ${activeCfg.pillIdle}`}><activeCfg.icon className="w-4 h-4" /></div>
+                    <div className={`relative w-9 h-9 rounded-full flex items-center justify-center ${activeCfg.pillIdle}`}>
+                      <activeCfg.icon className="w-4 h-4" />
+                    </div>
                   </div>
                 ) : (
-                  <div className="w-9 h-9 rounded-full bg-blue-500/15 border border-blue-500/25 flex items-center justify-center"><Loader className="w-4 h-4 text-blue-400 animate-spin" /></div>
+                  <div className="w-9 h-9 rounded-full bg-blue-500/15 border border-blue-500/25 flex items-center justify-center">
+                    <Loader className="w-4 h-4 text-blue-400 animate-spin" />
+                  </div>
                 )}
               </div>
+
               <div className="min-w-0">
-                <div className={`text-[10px] font-bold uppercase tracking-widest mb-0.5 ${isAborting ? "text-red-400" : activeCfg ? activeCfg.nav.split(" ").pop() : "text-blue-400"}`}>
-                  {isAborting ? "⛔ Stopping run" : activeCfg ? `${activeCfg.emoji} Scraping ${activeCfg.name}` : "⚙️ Initialising pipeline"}
+                <div className={`text-[10px] font-bold uppercase tracking-widest mb-0.5 ${isStopping ? "text-red-400" : activeCfg ? activeCfg.nav.split(" ").pop() : "text-blue-400"}`}>
+                  {isStopping
+                    ? "⛔ Stopping run"
+                    : activeCfg
+                    ? `${activeCfg.emoji} Scraping ${activeCfg.name}`
+                    : "⚙️ Initialising pipeline"}
                 </div>
                 <div className="text-sm font-semibold text-white/85 leading-snug">{currentStage}</div>
-                {stageDetail && <p className="text-[11px] text-white/45 leading-relaxed mt-1">{stageDetail}</p>}
+                {stageDetail && (
+                  <p className="text-[11px] text-white/45 leading-relaxed mt-1">{stageDetail}</p>
+                )}
               </div>
             </div>
+
             <div className="flex items-center gap-2 flex-shrink-0">
               <div className="text-right hidden sm:block">
                 <div className="text-[9px] text-white/25 uppercase tracking-widest">Elapsed</div>
                 <div className="font-mono text-sm font-bold text-white/50 tabular-nums">{fmtElapsed}</div>
               </div>
-              <button onClick={onStop} disabled={isAborting} className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-semibold hover:bg-red-500/20 transition-all disabled:opacity-40">
-                <X className="w-3 h-3" /><span className="hidden sm:inline">{isAborting ? "Stopping..." : "Stop"}</span>
+              <button
+                onClick={onStop}
+                disabled={isStopping}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-semibold hover:bg-red-500/20 transition-all disabled:opacity-40"
+              >
+                <X className="w-3 h-3" />
+                <span className="hidden sm:inline">{isStopping ? "Stopping..." : "Stop"}</span>
               </button>
             </div>
           </div>
 
+          {/* ── Source pills ── */}
           {sources.length > 0 && (
             <div className="flex gap-2 mb-4 flex-wrap">
               {sources.includes("craigslist") && <SourcePill sourceKey="CRAIGSLIST" activeSrc={activeSrc} log={log} />}
@@ -475,26 +525,82 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
             </div>
           )}
 
-          <div className="grid grid-cols-3 gap-2">
+          {/* ── Stats grid: DB Saved | Apify Found | Duplicates | Events ── */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
+
+            {/* DB Saved — live count from database (backend now updates this every poll) */}
             <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl px-3 py-2.5">
-              <div className="text-[9px] text-white/25 uppercase tracking-widest mb-1">Total saved</div>
+              <div className="text-[9px] text-white/25 uppercase tracking-widest mb-1">Leads Saved</div>
               <div className="text-xl font-bold tabular-nums text-emerald-400">{displayCount}</div>
-              {displayCount > 0 && <div className="text-[9px] text-emerald-400/40 mt-0.5 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />live</div>}
+              {displayCount > 0 && (
+                <div className="text-[9px] text-emerald-400/40 mt-0.5 flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                  in database
+                </div>
+              )}
             </div>
+
+            {/* Apify Found — raw items Apify has collected so far (may include dupes) */}
+            <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl px-3 py-2.5">
+              <div className="text-[9px] text-white/25 uppercase tracking-widest mb-1">Apify Found</div>
+              <div className="text-xl font-bold tabular-nums text-white/40">
+                {apifyItemCount > 0 ? `~${apifyItemCount}` : "—"}
+              </div>
+              <div className="text-[9px] text-white/20 mt-0.5">raw results</div>
+            </div>
+
+            {/* Duplicates */}
             <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl px-3 py-2.5">
               <div className="text-[9px] text-white/25 uppercase tracking-widest mb-1">Duplicates</div>
               <div className="text-xl font-bold tabular-nums text-white/35">{skipped}</div>
+              {skipped > 0 && <div className="text-[9px] text-white/20 mt-0.5">skipped</div>}
             </div>
+
+            {/* Events */}
             <div className="bg-white/[0.03] border border-white/[0.05] rounded-xl px-3 py-2.5">
               <div className="text-[9px] text-white/25 uppercase tracking-widest mb-1">Events</div>
               <div className="text-xl font-bold tabular-nums text-white/35">{log.length}</div>
             </div>
           </div>
+
+          {/* ── Lead limit progress bar (only shown when max_leads is set) ── */}
+          {maxLeads > 0 && (
+            <div className="mb-3">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[9px] text-white/25 uppercase tracking-widest">
+                  Lead limit progress
+                </span>
+                <span className={`text-[9px] font-bold tabular-nums ${isStopping ? "text-red-400" : "text-white/40"}`}>
+                  {displayCount} / {maxLeads}
+                  {isStopping && " — stopping"}
+                </span>
+              </div>
+              <div className="h-1.5 rounded-full bg-white/[0.06] overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all duration-500 ${
+                    isStopping
+                      ? "bg-red-500/70"
+                      : limitPct >= 90
+                      ? "bg-amber-400/70"
+                      : "bg-emerald-400/70"
+                  }`}
+                  style={{ width: `${limitPct}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* ── Latest incoming leads buffer ── */}
           {newLeadsBuffer && newLeadsBuffer.length > 0 && (
             <div className="mt-3 border border-emerald-500/15 rounded-xl overflow-hidden">
               <div className="px-3 py-2 bg-emerald-500/5 border-b border-emerald-500/10 flex items-center gap-2">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                <span className="text-[10px] font-semibold text-emerald-400 uppercase tracking-widest">Latest incoming leads</span>
+                <span className="text-[10px] font-semibold text-emerald-400 uppercase tracking-widest">
+                  Latest incoming leads
+                </span>
+                <span className="ml-auto text-[9px] text-emerald-400/40 font-mono tabular-nums">
+                  {newLeadsBuffer.length} buffered
+                </span>
               </div>
               <div className="divide-y divide-white/[0.04] max-h-36 overflow-y-auto">
                 {newLeadsBuffer.slice(0, 5).map(lead => (
@@ -502,17 +608,28 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
                     <SourceTag source={lead.source} />
                     <div className="flex-1 min-w-0">
                       <p className="text-[11px] text-white/70 font-medium truncate">{lead.title}</p>
-                      {lead.location && <p className="text-[10px] text-white/30 mt-0.5 flex items-center gap-1"><MapPin className="w-2.5 h-2.5" />{lead.location}</p>}
+                      {lead.location && (
+                        <p className="text-[10px] text-white/30 mt-0.5 flex items-center gap-1">
+                          <MapPin className="w-2.5 h-2.5" />{lead.location}
+                        </p>
+                      )}
                     </div>
                     {lead.phone && <Phone className="w-3 h-3 text-emerald-400/60 flex-shrink-0 mt-0.5" />}
                   </div>
                 ))}
-                {newLeadsBuffer.length > 5 && <div className="px-3 py-1.5 text-[10px] text-white/25 text-center">+{newLeadsBuffer.length - 5} more</div>}
+                {newLeadsBuffer.length > 5 && (
+                  <div className="px-3 py-1.5 text-[10px] text-white/25 text-center">
+                    +{newLeadsBuffer.length - 5} more
+                  </div>
+                )}
               </div>
             </div>
           )}
+
         </div>
       </div>
+
+      {/* ── Live event stream log ── */}
       <div className="bg-[#07090f] border border-white/[0.06] rounded-2xl overflow-hidden">
         <div className="px-4 py-3 border-b border-white/[0.05] flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
@@ -521,28 +638,45 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
         </div>
         <div ref={logRef} className="overflow-y-auto h-56 divide-y divide-white/[0.03]">
           {log.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center gap-3 text-white/20"><Loader className="w-5 h-5 animate-spin" /><span className="text-xs">Waiting for first pipeline event...</span></div>
+            <div className="h-full flex flex-col items-center justify-center gap-3 text-white/20">
+              <Loader className="w-5 h-5 animate-spin" />
+              <span className="text-xs">Waiting for first pipeline event...</span>
+            </div>
           ) : log.map((entry, i) => {
-            const cfg = LOG_CFG[entry.level] || LOG_CFG.info;
+            const cfg  = LOG_CFG[entry.level] || LOG_CFG.info;
             const Icon = cfg.icon;
-            const src = stageSource(entry.stage);
+            const src    = stageSource(entry.stage);
             const family = sourceFamily(src);
             const srcCfg = SOURCE_CFG[family?.toUpperCase()];
-            const ts = entry.ts ? new Date(entry.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+            const ts = entry.ts
+              ? new Date(entry.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+              : "";
             const isNewest = i === log.length - 1;
             return (
-              <div key={i} className={`px-4 py-2.5 flex gap-2.5 items-start transition-colors ${isNewest ? cfg.bg : ""}`} style={isNewest ? { borderLeft: "2px solid" } : { borderLeft: "2px solid transparent" }}>
+              <div
+                key={i}
+                className={`px-4 py-2.5 flex gap-2.5 items-start transition-colors ${isNewest ? cfg.bg : ""}`}
+                style={isNewest ? { borderLeft: "2px solid" } : { borderLeft: "2px solid transparent" }}
+              >
                 <div className="flex-shrink-0 pt-0.5">
                   {srcCfg && family !== "system" ? (
-                    <span className={`text-[8px] font-bold uppercase px-1 py-px rounded border ${srcCfg.badge}`}>{srcCfg.label}</span>
+                    <span className={`text-[8px] font-bold uppercase px-1 py-px rounded border ${srcCfg.badge}`}>
+                      {srcCfg.label}
+                    </span>
                   ) : (
-                    <span className="text-[8px] font-bold uppercase px-1 py-px rounded bg-white/5 text-white/25 border border-white/10">SYS</span>
+                    <span className="text-[8px] font-bold uppercase px-1 py-px rounded bg-white/5 text-white/25 border border-white/10">
+                      SYS
+                    </span>
                   )}
                 </div>
                 <Icon className={`w-3 h-3 mt-0.5 flex-shrink-0 ${isNewest ? cfg.text : "text-white/20"}`} />
                 <div className="flex-1 min-w-0">
-                  <span className={`text-[10px] font-semibold leading-tight ${isNewest ? cfg.text : "text-white/35"}`}>{entry.stage}</span>
-                  <p className={`text-[10px] leading-relaxed mt-px ${isNewest ? "text-white/60" : "text-white/22"}`}>{entry.detail}</p>
+                  <span className={`text-[10px] font-semibold leading-tight ${isNewest ? cfg.text : "text-white/35"}`}>
+                    {entry.stage}
+                  </span>
+                  <p className={`text-[10px] leading-relaxed mt-px ${isNewest ? "text-white/60" : "text-white/22"}`}>
+                    {entry.detail}
+                  </p>
                 </div>
                 <span className="text-[9px] text-white/15 font-mono flex-shrink-0 mt-0.5 tabular-nums">{ts}</span>
               </div>
@@ -1249,22 +1383,22 @@ const fetchNewLeadsOnly = useCallback(async () => {
   const fetchCities     = useCallback(async () => { try { const r = await axios.get(`${API}/meta/cities/`, { headers }); setCities(r.data.cities); } catch (_) {} }, [headers]);
   const fetchHistory    = useCallback(async () => { try { const r = await axios.get(`${API}/scrape/history/`, { headers }); setHistory(r.data); } catch (_) {} }, [headers]);
   const fetchFbGroupCount = useCallback(async () => { try { const r = await axios.get(`${API}/fb-groups/`, { headers }); setFbGroupCount((r.data.groups || []).length); } catch (_) {} }, [headers]);
-  const checkScrapeStatus = useCallback(async () => {
-    try {
-      const res = await axios.get(`${API}/scrape/status/`, { headers });
-      setScrapeStatus(res.data);
-if (res.data.status === "RUNNING") {
-        setScraping(true);
-        setRunId(res.data.run_id);
-        if (res.data.cancel_requested) setIsAborting(true);
-      } else {
-        setScraping(false);
-        setIsAborting(false);
-        // Refresh leads once when run completes
-        if (res.data.limit_stop) fetchLeads(1);
-      }
-    } catch (e) { console.error(e); }
-  }, [headers]);
+const checkScrapeStatus = useCallback(async () => {
+  try {
+    const res = await axios.get(`${API}/scrape/status/`, { headers });
+    setScrapeStatus(res.data);
+    if (res.data.status === "RUNNING") {
+      setScraping(true);
+      setRunId(res.data.run_id);
+      // ✅ FIXED: also trigger isAborting from is_stopping (covers limit-hit case)
+      if (res.data.cancel_requested || res.data.is_stopping) setIsAborting(true);
+    } else {
+      setScraping(false);
+      setIsAborting(false);
+      if (res.data.limit_stop) fetchLeads(1);
+    }
+  } catch (e) { console.error(e); }
+}, [headers]);
 
   useEffect(() => {
     fetchLeads(); fetchCategories(); fetchCities(); fetchHistory(); checkScrapeStatus(); fetchFbGroupCount();

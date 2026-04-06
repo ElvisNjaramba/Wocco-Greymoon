@@ -90,19 +90,37 @@ def _make_progress_callback(scrape_run_id, source_label: str, stats: dict, max_l
             return
         try:
             from base.models import ScrapeRun
+
             already_saved = stats.get("leads_saved", 0)
             detail = (
                 f"~{apify_count} result(s) found by Apify "
                 f"| {already_saved} lead(s) saved to DB so far"
             )
-            ScrapeRun.objects.filter(pk=scrape_run_id).update(stage_detail=detail)
+            # ✅ NEW: also update leads_collected live so frontend sees DB count in real-time
+            ScrapeRun.objects.filter(pk=scrape_run_id).update(
+                stage_detail=detail,
+                leads_collected=already_saved,   # <-- ADD THIS
+            )
 
-            if max_leads and already_saved >= max_leads:
+            if not max_leads:
+                return
+
+            # ✅ FIXED: base early-abort on DB-saved leads, not Apify estimate
+            limit_already_hit = already_saved >= max_leads
+
+            if limit_already_hit:
+                # ✅ NEW: set a "stopping" stage so frontend pill shows "Stopping..."
+                ScrapeRun.objects.filter(pk=scrape_run_id).update(
+                    current_stage=f"Stopping — lead limit of {max_leads} reached",
+                    stage_detail=f"{already_saved} lead(s) saved to DB — wrapping up actors...",
+                )
                 _abort_all_actors(scrape_run_id)
+
         except Exception:
             pass
-    return callback
 
+    return callback
+    
 class _ServiceLogger:
     def __init__(self, scrape_run_id, default_stage="Background"):
         self._run_id  = scrape_run_id
@@ -251,35 +269,35 @@ def _save_lead_batch(
 ):
     from base.models import ServiceLead, ScrapeRun
     import re
-
+ 
     def _norm_title(t: str) -> str:
         if not t:
             return ""
         t = t.lower().strip()
         t = re.sub(r'[\W_]+', ' ', t)
         return re.sub(r'\s+', ' ', t).strip()
-
+ 
     if not normalized_items:
         return
-
+ 
+    # ── Guard: quota already filled before we even start ──────
     if max_leads and stats["leads_saved"] >= max_leads:
-        _abort_all_actors(scrape_run_id)
-        raise LimitReached()
-
+        raise LimitReached()           # caller's except block will abort
+ 
     incoming_hashes = {i["content_hash"] for i in normalized_items if i.get("content_hash")}
     incoming_ids    = {i["post_id"]       for i in normalized_items if i.get("post_id")}
     incoming_titles = {_norm_title(i["title"]) for i in normalized_items if i.get("title")}
-
+ 
     existing_hashes = set(
         ServiceLead.objects.filter(content_hash__in=incoming_hashes)
         .values_list("content_hash", flat=True)
     ) if incoming_hashes else set()
-
+ 
     existing_ids = set(
         ServiceLead.objects.filter(post_id__in=incoming_ids)
         .values_list("post_id", flat=True)
     ) if incoming_ids else set()
-
+ 
     existing_titles: set[str] = set()
     if incoming_titles:
         existing_titles = {
@@ -287,36 +305,35 @@ def _save_lead_batch(
             for t in ServiceLead.objects.values_list("title", flat=True)
             if _norm_title(t) in incoming_titles
         }
-
+ 
     batch_saved_count = 0
-
+ 
     for lead_data in normalized_items:
-
+        # ── Per-lead quota check ───────────────────────────────
         if max_leads and stats["leads_saved"] >= max_leads:
-            _abort_all_actors(scrape_run_id)
-            raise LimitReached()
-
+            raise LimitReached()       # ← no _abort_all_actors here; caller handles it
+ 
         try:
             content_hash = lead_data.get("content_hash")
             if content_hash and content_hash in existing_hashes:
                 stats["leads_skipped"] += 1
                 _inc_skipped(stats, source_key)
                 continue
-
+ 
             post_id = lead_data.get("post_id")
             if post_id and post_id in existing_ids:
                 stats["leads_skipped"] += 1
                 _inc_skipped(stats, source_key)
                 continue
-
+ 
             norm_t = _norm_title(lead_data.get("title", ""))
             if norm_t and norm_t in existing_titles:
                 stats["leads_skipped"] += 1
                 _inc_skipped(stats, source_key)
                 continue
-
+ 
             score, score_reason = calculate_lead_score(lead_data)
-
+ 
             lead_dt = None
             raw_dt  = lead_data.get("datetime")
             if raw_dt:
@@ -324,7 +341,7 @@ def _save_lead_batch(
                     lead_dt = datetime.fromisoformat(str(raw_dt).replace("Z", "+00:00"))
                 except Exception:
                     pass
-
+ 
             ServiceLead.objects.create(
                 post_id=post_id or content_hash or "",
                 url=lead_data.get("url") or "",
@@ -349,22 +366,23 @@ def _save_lead_batch(
                 score_reason=score_reason,
                 raw_json=lead_data.get("raw_json"),
             )
+ 
             stats["leads_saved"] += 1
             batch_saved_count += 1
-
+ 
             if source_key:
                 stats.setdefault("source_saved", {})
                 stats["source_saved"][source_key] = (
                     stats["source_saved"].get(source_key, 0) + 1
                 )
-
+ 
             if norm_t:
                 existing_titles.add(norm_t)
             if content_hash:
                 existing_hashes.add(content_hash)
             if post_id:
                 existing_ids.add(post_id)
-
+ 
             if scrape_run_id:
                 try:
                     ScrapeRun.objects.filter(pk=scrape_run_id).update(
@@ -373,30 +391,31 @@ def _save_lead_batch(
                     )
                 except Exception:
                     pass
-
+ 
         except LimitReached:
             raise
-
+ 
         except Exception as e:
             if "unique_content_hash" in str(e) or "UNIQUE constraint" in str(e):
                 stats["leads_skipped"] += 1
                 _inc_skipped(stats, source_key)
                 continue
-
+ 
             err_msg = (
                 f"Save error for post_id={lead_data.get('post_id','?')[:20]}: "
                 f"{str(e)[:150]}"
             )
             print(f"[Pipeline] {err_msg}")
-            _log(scrape_run_id, "Pipeline — save error", err_msg, level="error")
+            _log(scrape_run_id, "Pipeline --- save error", err_msg, level="error")
             stats["errors"].append(err_msg)
-
+ 
     if source_key and scrape_run_id and batch_saved_count > 0:
         src_saved   = stats.get("source_saved",   {}).get(source_key, 0)
         src_skipped = stats.get("source_skipped", {}).get(source_key, 0)
         _emit_source_stats(
             scrape_run_id, source_key, src_saved, src_skipped, batch_saved_count
         )
+
 
 def _enrich_saved_google_leads(contacts_map: dict, scrape_run_id, log):
     if not contacts_map:

@@ -343,6 +343,12 @@ def scrape_status(request):
         "max_leads":       run.max_leads,
         "limit_stop":      run.limit_stop,
         "cancel_requested": run.cancel_requested,
+        "is_stopping": (
+                        run.status == "RUNNING" and (
+                        run.cancel_requested or
+                        (run.current_stage or "").lower().startswith("stopping")
+    )
+),
 
     })
 
