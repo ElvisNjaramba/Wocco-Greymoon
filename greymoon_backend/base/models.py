@@ -19,6 +19,7 @@ class ServiceLead(models.Model):
     post_id = models.CharField(max_length=100, unique=True)
     url = models.URLField(max_length=1000, blank=True)
     content_hash = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    title_ngram_hash = models.CharField(max_length=64, null=True, blank=True, db_index=True)
 
     title = models.CharField(max_length=500)
     post = models.TextField(null=True, blank=True)

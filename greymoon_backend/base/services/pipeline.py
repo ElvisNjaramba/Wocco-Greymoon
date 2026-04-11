@@ -271,46 +271,35 @@ def _save_lead_batch(
     max_leads: int = 0,
 ):
     from base.models import ServiceLead, ScrapeRun
+    from .fuzzy_title import title_similarity, make_title_bucket_hash, _normalize_title
     import re
- 
-    def _norm_title(t: str) -> str:
-        if not t:
-            return ""
-        t = t.lower().strip()
-        t = re.sub(r'[\W_]+', ' ', t)
-        return re.sub(r'\s+', ' ', t).strip()
- 
+
+    FUZZY_THRESHOLD = 0.65  # your requested threshold
+
     if not normalized_items:
         return
- 
-    # ── Guard: quota already filled before we even start ──────
+
     if max_leads and stats["leads_saved"] >= max_leads:
-        raise LimitReached()           # caller's except block will abort
- 
+        raise LimitReached()
+
     incoming_hashes = {i["content_hash"] for i in normalized_items if i.get("content_hash")}
     incoming_ids    = {i["post_id"]       for i in normalized_items if i.get("post_id")}
-    incoming_titles = {_norm_title(i["title"]) for i in normalized_items if i.get("title")}
- 
+
     existing_hashes = set(
         ServiceLead.objects.filter(content_hash__in=incoming_hashes)
         .values_list("content_hash", flat=True)
     ) if incoming_hashes else set()
- 
+
     existing_ids = set(
         ServiceLead.objects.filter(post_id__in=incoming_ids)
         .values_list("post_id", flat=True)
     ) if incoming_ids else set()
- 
-    existing_titles: set[str] = set()
-    if incoming_titles:
-        existing_titles = {
-            _norm_title(t)
-            for t in ServiceLead.objects.values_list("title", flat=True)
-            if _norm_title(t) in incoming_titles
-        }
- 
+
     batch_saved_count = 0
- 
+
+    # Tracks titles saved within this batch to catch intra-batch duplicates
+    batch_title_cache: list[str] = []
+
     for lead_data in normalized_items:
         if max_leads and stats["leads_saved"] >= max_leads:
             if scrape_run_id:
@@ -319,29 +308,63 @@ def _save_lead_batch(
                     ScrapeRun.objects.filter(pk=scrape_run_id).update(cancel_requested=True)
                 except Exception:
                     pass
-            raise LimitReached()     
- 
+            raise LimitReached()
+
         try:
+            # ── Check 1: content hash ──────────────────────────
             content_hash = lead_data.get("content_hash")
             if content_hash and content_hash in existing_hashes:
                 stats["leads_skipped"] += 1
                 _inc_skipped(stats, source_key)
                 continue
- 
+
+            # ── Check 2: post_id ───────────────────────────────
             post_id = lead_data.get("post_id")
             if post_id and post_id in existing_ids:
                 stats["leads_skipped"] += 1
                 _inc_skipped(stats, source_key)
                 continue
- 
-            norm_t = _norm_title(lead_data.get("title", ""))
-            if norm_t and norm_t in existing_titles:
+
+            # ── Check 3: fuzzy title (DB candidates via bucket) ─
+            incoming_title = lead_data.get("title", "")
+            is_fuzzy_dupe = False
+
+            if incoming_title:
+                bucket_hash = make_title_bucket_hash(incoming_title)
+
+                # Only compare against leads sharing the same bucket hash
+                # This is O(small) instead of O(all leads)
+                candidate_titles = list(
+                    ServiceLead.objects.filter(title_ngram_hash=bucket_hash)
+                    .values_list("title", flat=True)[:200]  # cap safety
+                )
+
+                for existing_title in candidate_titles:
+                    sim = title_similarity(incoming_title, existing_title)
+                    if sim >= FUZZY_THRESHOLD:
+                        is_fuzzy_dupe = True
+                        print(
+                            f"[Fuzzy Dedup] Skipping '{incoming_title[:60]}' "
+                            f"— {sim:.0%} similar to '{existing_title[:60]}'"
+                        )
+                        break
+
+                # Also check within the current batch (not yet saved)
+                if not is_fuzzy_dupe:
+                    for cached_title in batch_title_cache:
+                        sim = title_similarity(incoming_title, cached_title)
+                        if sim >= FUZZY_THRESHOLD:
+                            is_fuzzy_dupe = True
+                            break
+
+            if is_fuzzy_dupe:
                 stats["leads_skipped"] += 1
                 _inc_skipped(stats, source_key)
                 continue
- 
+
+            # ── Save ───────────────────────────────────────────
             score, score_reason = calculate_lead_score(lead_data)
- 
+
             lead_dt = None
             raw_dt  = lead_data.get("datetime")
             if raw_dt:
@@ -349,7 +372,9 @@ def _save_lead_batch(
                     lead_dt = datetime.fromisoformat(str(raw_dt).replace("Z", "+00:00"))
                 except Exception:
                     pass
- 
+
+            bucket_hash = make_title_bucket_hash(incoming_title) if incoming_title else ""
+
             ServiceLead.objects.create(
                 post_id=post_id or content_hash or "",
                 url=lead_data.get("url") or "",
@@ -373,24 +398,24 @@ def _save_lead_batch(
                 score=score,
                 score_reason=score_reason,
                 raw_json=lead_data.get("raw_json"),
+                title_ngram_hash=bucket_hash,
             )
- 
+
             stats["leads_saved"] += 1
             batch_saved_count += 1
- 
+            batch_title_cache.append(incoming_title)
+
             if source_key:
                 stats.setdefault("source_saved", {})
                 stats["source_saved"][source_key] = (
                     stats["source_saved"].get(source_key, 0) + 1
                 )
- 
-            if norm_t:
-                existing_titles.add(norm_t)
+
             if content_hash:
                 existing_hashes.add(content_hash)
             if post_id:
                 existing_ids.add(post_id)
- 
+
             if scrape_run_id:
                 try:
                     ScrapeRun.objects.filter(pk=scrape_run_id).update(
@@ -399,16 +424,16 @@ def _save_lead_batch(
                     )
                 except Exception:
                     pass
- 
+
         except LimitReached:
             raise
- 
+
         except Exception as e:
             if "unique_content_hash" in str(e) or "UNIQUE constraint" in str(e):
                 stats["leads_skipped"] += 1
                 _inc_skipped(stats, source_key)
                 continue
- 
+
             err_msg = (
                 f"Save error for post_id={lead_data.get('post_id','?')[:20]}: "
                 f"{str(e)[:150]}"
@@ -416,7 +441,7 @@ def _save_lead_batch(
             print(f"[Pipeline] {err_msg}")
             _log(scrape_run_id, "Pipeline --- save error", err_msg, level="error")
             stats["errors"].append(err_msg)
- 
+
     if source_key and scrape_run_id and batch_saved_count > 0:
         src_saved   = stats.get("source_saved",   {}).get(source_key, 0)
         src_skipped = stats.get("source_skipped", {}).get(source_key, 0)
