@@ -382,7 +382,7 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
   }, [stageDetail]);
 
   // ── Best DB-saved count: prefer serverSaved (now updated live by backend) ──
-  const displayCount = Math.max(liveLeadCount ?? 0, serverSaved);
+  const displayCount = serverSaved || (liveLeadCount ?? 0);
 
   const sourceStats = useMemo(() => {
     if (scrapeStatus?.source_stats && Object.keys(scrapeStatus.source_stats).length > 0) {
@@ -471,8 +471,7 @@ function ScrapeLiveDashboard({ scrapeStatus, onStop, isAborting, liveLeadCount, 
               </div>
               <button
                 onClick={onStop}
-                disabled={isStopping}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-semibold hover:bg-red-500/20 transition-all disabled:opacity-40"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-semibold hover:bg-red-500/20 transition-all"
               >
                 <X className="w-3 h-3" />
                 <span className="hidden sm:inline">{isStopping ? "Stopping..." : "Stop"}</span>
@@ -1291,6 +1290,8 @@ export default function Services() {
   const [pendingNewCount, setPendingNewCount] = useState(0);
   const [fbGeoCoords, setFbGeoCoords]         = useState({});
   const geocodingQueue = useRef(new Set());
+  const lastCancelRef = useRef(0);
+
   const [zipHint, setZipHint] = useState(null);
   const [fbGroupCount, setFbGroupCount] = useState(0);
 
@@ -1495,8 +1496,12 @@ const checkScrapeStatus = useCallback(async () => {
     } catch (e) { alert(e.response?.data?.error || "Failed to start scrape."); setScraping(false); }
   };
 
-  const cancelScrape = async () => {
-    if (!runId) return; setIsAborting(true);
+const cancelScrape = async () => {
+    if (!runId) return;
+    const now = Date.now();
+    if (now - lastCancelRef.current < 4000) return; // prevent rapid re-clicks
+    lastCancelRef.current = now;
+    setIsAborting(true);
     try {
       await axios.post(`${API}/scrape/cancel/`, { run_id: runId }, { headers });
       setTimeout(() => { fetchLeads(); fetchHistory(); checkScrapeStatus(); fetchFbGroupCount(); }, 1000);
@@ -1839,7 +1844,9 @@ onBlur={e => setMaxPostsPerGroup(Math.max(5, Math.min(500, parseInt(e.target.val
               <div className="w-full bg-white/5 rounded-xl h-1.5 overflow-hidden"><div className="h-full bg-gradient-to-r from-blue-500 to-violet-500 animate-pulse rounded-full w-2/3" /></div>
               <div className="flex gap-2">
                 <div className="flex-1 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs font-semibold text-center">{isAborting ? "Stopping..." : "Running..."}</div>
-                <button onClick={cancelScrape} disabled={isAborting} className="px-4 py-2.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-semibold hover:bg-red-500/20 transition-all disabled:opacity-50">Stop</button>
+                <button onClick={cancelScrape} className="px-4 py-2.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-semibold hover:bg-red-500/20 transition-all">
+                  {isAborting ? "Stopping..." : "Stop"}
+                </button>
               </div>
               <p className="text-[10px] text-emerald-400/50 text-center">✓ Results save as they arrive</p>
             </div>

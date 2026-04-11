@@ -105,9 +105,15 @@ def _make_progress_callback(scrape_run_id, source_label: str, stats: dict, max_l
             remaining = max(0, max_leads - already_saved)
  
             limit_already_hit  = already_saved >= max_leads          
-            actor_has_enough   = remaining > 0 and apify_count >= remaining * 2  
- 
+            actor_has_enough = apify_count >= max(remaining, 1)
+
             if limit_already_hit or actor_has_enough:
+                if scrape_run_id:
+                    try:
+                        from base.models import ScrapeRun
+                        ScrapeRun.objects.filter(pk=scrape_run_id).update(cancel_requested=True)
+                    except Exception:
+                        pass
                 _abort_all_actors(scrape_run_id)
  
         except Exception:
@@ -304,9 +310,14 @@ def _save_lead_batch(
     batch_saved_count = 0
  
     for lead_data in normalized_items:
-        # ── Per-lead quota check ───────────────────────────────
         if max_leads and stats["leads_saved"] >= max_leads:
-            raise LimitReached()       # ← no _abort_all_actors here; caller handles it
+            if scrape_run_id:
+                try:
+                    from base.models import ScrapeRun
+                    ScrapeRun.objects.filter(pk=scrape_run_id).update(cancel_requested=True)
+                except Exception:
+                    pass
+            raise LimitReached()     
  
         try:
             content_hash = lead_data.get("content_hash")
