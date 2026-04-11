@@ -9,8 +9,8 @@ SERP_ACTOR_ID       = "apify~google-search-scraper"
 CRAWL_ACTOR_ID      = "apify~website-content-crawler"
 
 POLL_INTERVAL       = 5
-DATASET_FETCH_LIMIT = 500
-DEFAULT_MAX_PAGES   = 3
+DATASET_FETCH_LIMIT = 2000
+DEFAULT_MAX_PAGES   = 10
 CRAWL_TIMEOUT       = 480
 CRAWL_BATCH_SIZE    = 5
 
@@ -274,20 +274,28 @@ def _run_crawl_parallel(
         )
 
         poll_count = 0
+        error_count = 0
+        MAX_POLL_ERRORS = 5
         while True:
             if _is_cancel_requested(scrape_run_id):
-                log(
-                    f"[Google Website Crawl] Cancel detected mid-crawl — "
-                    f"aborting batch {b_idx+1} and saving partial contacts"
-                )
                 _abort_apify_run(run_id)
+                log(f"[Google Website Crawl] Cancelled mid-crawl — aborting batch {b_idx+1}")
                 break
 
             try:
                 status = _poll_run_status(run_id)
+                error_count = 0  # reset on success
             except Exception as e:
-                log(f"[Google Website Crawl] Status check error for batch {b_idx+1}: {e}")
-                break
+                error_count += 1
+                log(f"[Google Website Crawl] Status check error for batch {b_idx+1} ({error_count}/{MAX_POLL_ERRORS}): {e}")
+                if error_count >= MAX_POLL_ERRORS:
+                    log(f"[Google Website Crawl] Batch {b_idx+1} — max poll errors reached, skipping batch")
+                    break
+                for _ in range(POLL_INTERVAL):
+                    if _is_cancel_requested(scrape_run_id):
+                        break
+                    time.sleep(1)
+                continue
 
             poll_count += 1
             if status == "SUCCEEDED":

@@ -4,7 +4,7 @@ from django.conf import settings
 
 ACTOR_ID                 = "ivanvs~craigslist-scraper"
 POLL_INTERVAL            = 5
-COOLDOWN_BETWEEN_RUNS    = 20
+COOLDOWN_BETWEEN_RUNS    = 10
 COOLDOWN_POLL_INTERVAL   = 1
 MAX_CITIES_PER_RUN       = 3
 

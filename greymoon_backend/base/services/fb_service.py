@@ -6,8 +6,8 @@ FB_POSTS_ACTOR_ID = "apify~facebook-groups-scraper"
 
 POLL_INTERVAL            = 5
 GROUPS_PER_POST_BATCH    = 5
-MAX_POSTS_PER_GROUP      = 50
-COOLDOWN_BETWEEN_BATCHES = 10
+MAX_POSTS_PER_GROUP      = 1000
+COOLDOWN_BETWEEN_BATCHES = 5
 
 
 def _apify_headers() -> dict:
@@ -97,10 +97,11 @@ def _poll_until_done(
     scrape_run_id=None,
     log=None,
     progress_callback=None,
-) -> str:
+    ) -> str:
     import time, requests
  
     poll_count = 0
+    poll_error_count = 0
  
     while True:
         if _is_cancel_requested(scrape_run_id):
@@ -116,12 +117,16 @@ def _poll_until_done(
             )
             res.raise_for_status()
             status = res.json()["data"]["status"]
+            poll_error_count = 0  # reset on success
         except Exception as e:
-            log(f"[{label}] Status check error: {e} --- retrying")
+            poll_error_count += 1
+            log(f"[{label}] Status check error ({poll_error_count}/5): {e} --- retrying")
+            if poll_error_count >= 5:
+                log(f"[{label}] Max poll errors reached --- treating run {run_id} as failed")
+                return "FAILED"
             for _ in range(POLL_INTERVAL):
                 if _is_cancel_requested(scrape_run_id):
                     _abort_apify_run(run_id)
-                    log(f"[{label}] Cancelled during retry wait --- run {run_id} aborted")
                     return "ABORTED"
                 time.sleep(1)
             continue
