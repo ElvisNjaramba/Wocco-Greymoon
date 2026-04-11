@@ -250,7 +250,9 @@ def scrape_fb_groups_progressive(
             f"[Facebook Posts] Batch {b_idx + 1}/{total_batches} — "
             f"scraping {len(batch)} group(s): {batch_labels}"
         )
-
+        if _is_cancel_requested(scrape_run_id):
+            log(f"[Facebook Posts] Cancel requested — stopping before batch {b_idx + 1}")
+            return
         payload = build_fb_posts_payload(batch, max_posts_per_group)
         try:
             result = _launch_actor(FB_POSTS_ACTOR_ID, payload, scrape_run_id)

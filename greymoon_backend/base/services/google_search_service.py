@@ -435,6 +435,7 @@ def scrape_google_search_progressive(
         serp_pages = []
         serp_poll  = 0
         serp_ok    = False
+        serp_error_count = 0 
 
         while True:
             if _is_cancel_requested(scrape_run_id):
@@ -450,8 +451,13 @@ def scrape_google_search_progressive(
  
             try:
                 status = _poll_run_status(serp_run_id)
+                serp_error_count = 0
             except Exception as e:
-                log(f"[Google Search] SERP status check error: {e} --- retrying...")
+                serp_error_count += 1
+                log(f"[Google Search] SERP status check error ({serp_error_count}/5): {e} --- retrying...")
+                if serp_error_count >= 5:
+                    log(f"[Google Search] Max poll errors — skipping query {i+1}")
+                    break
                 for _ in range(POLL_INTERVAL):
                     if _is_cancel_requested(scrape_run_id):
                         break

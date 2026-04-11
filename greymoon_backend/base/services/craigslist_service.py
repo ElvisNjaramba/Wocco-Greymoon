@@ -119,6 +119,7 @@ def wait_for_run(
     log = log_fn or print
     url = f"https://api.apify.com/v2/actor-runs/{run_id}"
     poll_count = 0
+    cl_poll_errors = 0
  
     while True:
         # ── Cancel / limit check ──────────────────────────────
@@ -126,9 +127,23 @@ def wait_for_run(
             _abort_apify_run(run_id)
             raise Exception(f"[{source_label}] Cancelled by user")
  
-        res = requests.get(url, headers=_apify_headers())
-        res.raise_for_status()
-        status = res.json()["data"]["status"]
+        try:
+            res = requests.get(url, headers=_apify_headers(), timeout=15)
+            res.raise_for_status()
+            status = res.json()["data"]["status"]
+            cl_poll_errors = 0
+        except Exception as e:
+            cl_poll_errors += 1
+            log(f"[{source_label}] Status check error ({cl_poll_errors}/5): {e}")
+            if cl_poll_errors >= 5:
+                raise Exception(f"[{source_label}] Max poll errors reached — aborting")
+            for _ in range(POLL_INTERVAL):
+                if _is_cancel_requested(scrape_run_id):
+                    _abort_apify_run(run_id)
+                    raise Exception(f"[{source_label}] Cancelled by user")
+                time.sleep(1)
+            continue
+
         poll_count += 1
  
         if dataset_id and poll_count % 2 == 0:
@@ -239,9 +254,7 @@ def scrape_craigslist_progressive(
             return
 
         results = fetch_dataset(dataset_id)
-
         log(f"[Craigslist] Got {len(results)} results from batch {i+1}")
-
         yield results
 
         if i < len(batches) - 1:

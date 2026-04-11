@@ -105,7 +105,9 @@ def _make_progress_callback(scrape_run_id, source_label: str, stats: dict, max_l
             remaining = max(0, max_leads - already_saved)
  
             limit_already_hit  = already_saved >= max_leads          
-            actor_has_enough = apify_count >= max(remaining, 1)
+            actor_has_enough = apify_count >= max(remaining, 1) or (
+            source_label == "Facebook" and apify_count >= max(remaining // 2, 1)
+            )
 
             if limit_already_hit or actor_has_enough:
                 if scrape_run_id:
@@ -531,12 +533,21 @@ def _process_and_save_fb_batch(
             f"{len(fresh_items)} new post(s) to process.",
         )
 
+if max_leads and stats["leads_saved"] >= max_leads:
+        raise LimitReached()
+
+    # Trim fresh_items to only what's needed to hit the limit
+    if max_leads:
+        remaining = max_leads - stats["leads_saved"]
+        if remaining <= 0:
+            raise LimitReached()
+        fresh_items = fresh_items[:remaining]
+
     normalized = [
         normalize_facebook(item, service_category="", location_str="")
         for item in fresh_items
     ]
 
-    # LimitReached bubbles straight up to _run_facebook_pipeline
     _save_lead_batch(
         normalized, stats, scrape_run_id,
         source_key="facebook", max_leads=max_leads,
@@ -689,6 +700,9 @@ def run_pipeline(
                     f"Received {len(batch_items)} listing(s) "
                     f"({len(fresh)} new). Saving…",
                 )
+
+                if max_leads and stats["leads_saved"] >= max_leads:
+                    raise LimitReached()
 
                 normalized = [
                     normalize_craigslist(
@@ -930,6 +944,9 @@ def _run_facebook_pipeline(
                 chunk_urls_set.add(g_url)
         chunk_urls = list(chunk_urls_set) if chunk_urls_set else all_group_urls
 
+        if max_leads and stats["leads_saved"] >= max_leads:
+            raise LimitReached()
+
         # LimitReached bubbles up to run_pipeline
         _process_and_save_fb_batch(
             chunk_urls=chunk_urls,
@@ -1023,6 +1040,9 @@ def _run_google_pipeline(
         ),
     ):
         query_num += 1
+
+        if max_leads and stats["leads_saved"] >= max_leads:
+            raise LimitReached()
 
         serp_pages   = result_bundle.get("serp_pages", [])
         contacts_map = result_bundle.get("contacts_map", {})
