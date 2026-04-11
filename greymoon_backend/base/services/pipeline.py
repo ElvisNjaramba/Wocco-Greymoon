@@ -533,15 +533,14 @@ def _process_and_save_fb_batch(
             f"{len(fresh_items)} new post(s) to process.",
         )
 
-if max_leads and stats["leads_saved"] >= max_leads:
+    if max_leads and stats["leads_saved"] >= max_leads:
         raise LimitReached()
 
-    # Trim fresh_items to only what's needed to hit the limit
-    if max_leads:
-        remaining = max_leads - stats["leads_saved"]
-        if remaining <= 0:
-            raise LimitReached()
-        fresh_items = fresh_items[:remaining]
+        if max_leads:
+            remaining = max_leads - stats["leads_saved"]
+            if remaining <= 0:
+                raise LimitReached()
+            fresh_items = fresh_items[:remaining]
 
     normalized = [
         normalize_facebook(item, service_category="", location_str="")
