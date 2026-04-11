@@ -86,41 +86,31 @@ def _emit_source_stats(scrape_run_id, source: str, saved: int, skipped: int, bat
 
 def _make_progress_callback(scrape_run_id, source_label: str, stats: dict, max_leads: int = 0):
     def callback(apify_count: int):
-        if not scrape_run_id:
+        if not scrape_run_id or not max_leads:
             return
         try:
             from base.models import ScrapeRun
- 
-            already_saved = stats.get("leads_saved", 0)
+
+            # Read live count from DB, not the local stats dict
+            run = ScrapeRun.objects.filter(pk=scrape_run_id).only("leads_collected").first()
+            if not run:
+                return
+
+            already_saved = run.leads_collected
+
             detail = (
                 f"~{apify_count} result(s) found by Apify "
                 f"| {already_saved} lead(s) saved to DB so far"
             )
             ScrapeRun.objects.filter(pk=scrape_run_id).update(stage_detail=detail)
- 
-            if not max_leads:
-                return  # unlimited — nothing to do
- 
-            # ── FIX: abort as soon as the actor has found enough ──
-            remaining = max(0, max_leads - already_saved)
- 
-            limit_already_hit  = already_saved >= max_leads          
-            actor_has_enough = apify_count >= max(remaining, 1) or (
-            source_label == "Facebook" and apify_count >= max(remaining // 2, 1)
-            )
 
-            if limit_already_hit or actor_has_enough:
-                if scrape_run_id:
-                    try:
-                        from base.models import ScrapeRun
-                        ScrapeRun.objects.filter(pk=scrape_run_id).update(cancel_requested=True)
-                    except Exception:
-                        pass
+            if already_saved >= max_leads:
+                ScrapeRun.objects.filter(pk=scrape_run_id).update(cancel_requested=True)
                 _abort_all_actors(scrape_run_id)
- 
+
         except Exception:
             pass
- 
+
     return callback
 
 
@@ -536,7 +526,6 @@ def _process_and_save_fb_batch(
         )
 
     all_urls = [u for u in (_item_url(i) for i in fb_batch) if u]
-
     already_seen: set[str] = set(
         ScrapedFbPost.objects.filter(post_url__in=all_urls)
         .values_list("post_url", flat=True)
@@ -558,13 +547,19 @@ def _process_and_save_fb_batch(
             f"{len(fresh_items)} new post(s) to process.",
         )
 
-    if max_leads and stats["leads_saved"] >= max_leads:
-        raise LimitReached()
-
-        if max_leads:
-            remaining = max_leads - stats["leads_saved"]
-            if remaining <= 0:
-                raise LimitReached()
+    # ── Hard cap: trim fresh_items to what's remaining ────────
+    if max_leads:
+        remaining = max_leads - stats["leads_saved"]
+        if remaining <= 0:
+            raise LimitReached()
+        if len(fresh_items) > remaining:
+            _log(
+                scrape_run_id,
+                f"Facebook — chunk {chunk_num} capped",
+                f"Trimming {len(fresh_items)} posts to {remaining} "
+                f"(lead limit almost reached).",
+                level="warning",
+            )
             fresh_items = fresh_items[:remaining]
 
     normalized = [
@@ -598,7 +593,6 @@ def _process_and_save_fb_batch(
 
     fb_saved   = stats.get("source_saved",   {}).get("facebook", 0)
     fb_skipped = stats.get("source_skipped", {}).get("facebook", 0)
-
     _log(
         scrape_run_id,
         f"Facebook — chunk {chunk_num} saved",
@@ -606,7 +600,6 @@ def _process_and_save_fb_batch(
         f"{fb_saved} FB leads saved, {fb_skipped} duplicate(s).",
         level="success",
     )
-
 
 def run_pipeline(
     location_type,
@@ -948,6 +941,19 @@ def _run_facebook_pipeline(
     ):
         chunk_num += 1
 
+        # ── Check limit before processing each batch ──────────
+        if max_leads and stats["leads_saved"] >= max_leads:
+            raise LimitReached()
+
+        if _cancelled(scrape_run_id):
+            fb_saved = stats.get("source_saved", {}).get("facebook", 0)
+            _log(
+                scrape_run_id, "Facebook — cancelled",
+                f"Stopped before chunk {chunk_num}. {fb_saved} FB lead(s) saved.",
+                level="warning",
+            )
+            return
+
         if not batch_posts:
             _log(
                 scrape_run_id,
@@ -971,7 +977,6 @@ def _run_facebook_pipeline(
         if max_leads and stats["leads_saved"] >= max_leads:
             raise LimitReached()
 
-        # LimitReached bubbles up to run_pipeline
         _process_and_save_fb_batch(
             chunk_urls=chunk_urls,
             fb_batch=batch_posts,
@@ -1001,7 +1006,6 @@ def _run_facebook_pipeline(
         f"{fb_saved} FB lead(s) saved.",
         level="success",
     )
-
 
 def _run_google_pipeline(
     *,
