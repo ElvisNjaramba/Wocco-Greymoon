@@ -1736,10 +1736,11 @@ const cancelScrape = async () => {
                   <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30">Posts per Group</label>
                   <span className="text-sm font-bold text-indigo-300 tabular-nums">{maxPostsPerGroup}</span>
                 </div>
-                <input type="number" min={5} max={500} value={maxPostsPerGroup}
+                {/* <input type="number" min={5} max={500} value={maxPostsPerGroup}
 onChange={e => setMaxPostsPerGroup(parseInt(e.target.value) || "")}
 onBlur={e => setMaxPostsPerGroup(Math.max(5, Math.min(500, parseInt(e.target.value) || 50)))}
                   className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/60 transition-all tabular-nums" />
+               */}
               </div>
               <div>
                 <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30 block mb-1">Group URLs</label>
@@ -1796,7 +1797,7 @@ onBlur={e => setMaxPostsPerGroup(Math.max(5, Math.min(500, parseInt(e.target.val
 
 
           {/* ── Max Leads cap ── */}
-<div className="space-y-1.5 pt-1 border-t border-white/[0.06]">
+{/* <div className="space-y-1.5 pt-1 border-t border-white/[0.06]">
   <div className="flex items-center justify-between">
     <label className="text-[11px] font-semibold uppercase tracking-widest text-white/30">
       Lead Limit
@@ -1824,7 +1825,7 @@ onBlur={e => setMaxPostsPerGroup(Math.max(5, Math.min(500, parseInt(e.target.val
       <span className="text-[10px] text-amber-300/60">Run will stop as soon as {maxLeads} lead{maxLeads !== 1 ? "s" : ""} are saved</span>
     </div>
   )}
-</div>
+</div> */}
 
           {!scraping ? (
             <button onClick={startScrape}
