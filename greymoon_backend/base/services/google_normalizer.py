@@ -2,6 +2,19 @@ import hashlib
 import json
 import re
 
+
+
+
+def _normalize_title(title: str) -> str:
+    if not title:
+        return ""
+    t = title.lower().strip()
+    t = re.sub(r'[\W_]+', ' ', t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+
+    
 def _extract_emails(text: str) -> str | None:
     if not text:
         return None

@@ -27,6 +27,6 @@ def start_pipeline_thread(
             max_leads=max_leads,
         )
 
-    t = threading.Thread(target=_run, daemon=True)
+    t = threading.Thread(target=_run, daemon=False)
     t.start()
     return t

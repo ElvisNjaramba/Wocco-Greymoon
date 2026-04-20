@@ -53,7 +53,6 @@ def _is_cancel_requested(scrape_run_id) -> bool:
 
 
 def _fetch_dataset_count(dataset_id: str) -> int:
-    """Poll Apify dataset metadata for current item count — no download needed."""
     try:
         resp = requests.get(
             f"https://api.apify.com/v2/datasets/{dataset_id}",
@@ -90,87 +89,16 @@ def _launch_actor(
     return run_id, dataset_id
 
 
-def _poll_until_done(
-    run_id: str,
-    dataset_id: str = None,
-    label: str = "Facebook Posts",
-    scrape_run_id=None,
-    log=None,
-    progress_callback=None,
-    ) -> str:
-    import time, requests
- 
-    poll_count = 0
-    poll_error_count = 0
- 
-    while True:
-        if _is_cancel_requested(scrape_run_id):
-            _abort_apify_run(run_id)
-            log(f"[{label}] Cancelled by user --- run {run_id} aborted")
-            return "ABORTED"
- 
-        try:
-            res = requests.get(
-                f"https://api.apify.com/v2/actor-runs/{run_id}",
-                headers=_apify_headers(),
-                timeout=15,
-            )
-            res.raise_for_status()
-            status = res.json()["data"]["status"]
-            poll_error_count = 0  # reset on success
-        except Exception as e:
-            poll_error_count += 1
-            log(f"[{label}] Status check error ({poll_error_count}/5): {e} --- retrying")
-            if poll_error_count >= 5:
-                log(f"[{label}] Max poll errors reached --- treating run {run_id} as failed")
-                return "FAILED"
-            for _ in range(POLL_INTERVAL):
-                if _is_cancel_requested(scrape_run_id):
-                    _abort_apify_run(run_id)
-                    return "ABORTED"
-                time.sleep(1)
-            continue
- 
-        poll_count += 1
- 
-        if dataset_id and poll_count % 2 == 0:
-            count = _fetch_dataset_count(dataset_id)
-            if progress_callback and count > 0:
-                progress_callback(count)
- 
-            # ── FIX: re-check cancel immediately after callback ──
-            if _is_cancel_requested(scrape_run_id):
-                _abort_apify_run(run_id)
-                log(f"[{label}] Cancelled by user --- run {run_id} aborted")
-                return "ABORTED"
- 
-            if poll_count % 4 == 0:
-                log(f"[{label}] Still running ({poll_count * POLL_INTERVAL}s) | ~{count} post(s) found so far...")
-        elif poll_count % 4 == 0:
-            log(f"[{label}] Still running ({poll_count * POLL_INTERVAL}s)...")
- 
-        if status == "SUCCEEDED":
-            return "SUCCEEDED"
- 
-        if status in ("FAILED", "ABORTED", "TIMED-OUT"):
-            log(f"[{label}] Actor run {run_id} ended with: {status}")
-            return status
- 
-        for _ in range(POLL_INTERVAL):
-            if _is_cancel_requested(scrape_run_id):
-                _abort_apify_run(run_id)
-                log(f"[{label}] Cancelled by user --- run {run_id} aborted")
-                return "ABORTED"
-            time.sleep(1)
 def _fetch_dataset(dataset_id: str, limit: int = 1000) -> list[dict]:
     resp = requests.get(
         f"https://api.apify.com/v2/datasets/{dataset_id}"
-        f"/items?clean=true&limit={limit}",
+        f"/items?limit={limit}",
         headers=_apify_headers(),
-        timeout=30,
+        timeout=60,
     )
     resp.raise_for_status()
-    return resp.json()
+    items = resp.json()
+    return [i for i in items if isinstance(i, dict)]
 
 
 def upsert_fb_groups(group_urls: list[str], log=None) -> None:
@@ -194,12 +122,13 @@ def build_fb_posts_payload(
     max_posts: int = MAX_POSTS_PER_GROUP,
 ) -> dict:
     return {
-        "startUrls": [{"url": u} for u in group_urls],
-        "maxPosts":  max_posts,
-        "sort":      "RECENT_ACTIVITY",
+        "startUrls":       [{"url": u} for u in group_urls],
+        "maxPosts":        max_posts,
+        "maxPostsPerPage": max_posts,
+        "sort":            "RECENT_ACTIVITY",
         "proxyConfiguration": {
-            "useApifyProxy":    True,
-            "apifyProxyGroups": ["RESIDENTIAL"],
+            "useApifyProxy":     True,
+            "apifyProxyGroups":  ["RESIDENTIAL"],
             "apifyProxyCountry": "US",
         },
     }
@@ -212,11 +141,6 @@ def scrape_fb_groups_progressive(
     log=None,
     progress_callback=None,
 ):
-    """
-    Generator — yields one list[dict] of raw post items per batch of groups.
-    progress_callback(apify_item_count) is fired every ~10s while the
-    Apify actor is running so the caller can surface live counts.
-    """
     log = log or print
 
     if not group_urls:
@@ -250,9 +174,11 @@ def scrape_fb_groups_progressive(
             f"[Facebook Posts] Batch {b_idx + 1}/{total_batches} — "
             f"scraping {len(batch)} group(s): {batch_labels}"
         )
+
         if _is_cancel_requested(scrape_run_id):
             log(f"[Facebook Posts] Cancel requested — stopping before batch {b_idx + 1}")
             return
+
         payload = build_fb_posts_payload(batch, max_posts_per_group)
         try:
             result = _launch_actor(FB_POSTS_ACTOR_ID, payload, scrape_run_id)
@@ -270,41 +196,120 @@ def scrape_fb_groups_progressive(
             f"(run {run_id}) — waiting for posts…"
         )
 
-        status = _poll_until_done(
-            run_id,
-            dataset_id=dataset_id,
-            label="Facebook Posts",
-            scrape_run_id=scrape_run_id,
-            log=log,
-            progress_callback=progress_callback,
-        )
+        # ── Stream results as they arrive ─────────────────────────
+        last_saved_count = 0
+        final_status     = None
+        poll_count       = 0
+        poll_error_count = 0
 
-        items = []
+        while True:
+            # Cancel check at top of every loop
+            if _is_cancel_requested(scrape_run_id):
+                _abort_apify_run(run_id)
+                log(f"[Facebook Posts] Cancelled by user --- run {run_id} aborted")
+                final_status = "ABORTED"
+                break
+
+            # Poll actor status
+            try:
+                res = requests.get(
+                    f"https://api.apify.com/v2/actor-runs/{run_id}",
+                    headers=_apify_headers(),
+                    timeout=15,
+                )
+                res.raise_for_status()
+                status = res.json()["data"]["status"]
+                poll_error_count = 0
+            except Exception as e:
+                poll_error_count += 1
+                log(f"[Facebook Posts] Status check error ({poll_error_count}/5): {e}")
+                if poll_error_count >= 5:
+                    final_status = "FAILED"
+                    break
+                for _ in range(POLL_INTERVAL):
+                    if _is_cancel_requested(scrape_run_id):
+                        break
+                    time.sleep(1)
+                continue
+
+            poll_count += 1
+
+            # ── Fetch and yield NEW items every poll ──────────────
+            current_count = _fetch_dataset_count(dataset_id)
+            if progress_callback and current_count > 0:
+                progress_callback(current_count)
+
+            if current_count > last_saved_count:
+                try:
+                    all_items = _fetch_dataset(
+                        dataset_id,
+                        limit=len(batch) * max_posts_per_group * 2,
+                    )
+                    new_items = all_items[last_saved_count:]
+                    if new_items:
+                        log(
+                            f"[Facebook Posts] Batch {b_idx + 1} — "
+                            f"yielding {len(new_items)} new post(s) "
+                            f"({current_count} total so far)"
+                        )
+                        _update_group_metadata(batch, new_items, log)
+                        yield new_items
+                        last_saved_count = len(all_items)
+                except Exception as e:
+                    log(f"[Facebook Posts] Mid-run fetch error: {e}")
+
+            # Re-check cancel after yield — limit may have just been hit
+            if _is_cancel_requested(scrape_run_id):
+                _abort_apify_run(run_id)
+                log(f"[Facebook Posts] Cancelled after yield --- run {run_id} aborted")
+                final_status = "ABORTED"
+                break
+
+            if poll_count % 4 == 0:
+                log(
+                    f"[Facebook Posts] Still running "
+                    f"({poll_count * POLL_INTERVAL}s) | "
+                    f"~{current_count} post(s) found so far..."
+                )
+
+            if status == "SUCCEEDED":
+                final_status = "SUCCEEDED"
+                break
+
+            if status in ("FAILED", "ABORTED", "TIMED-OUT"):
+                log(f"[Facebook Posts] Actor run {run_id} ended with: {status}")
+                final_status = status
+                break
+
+            # Interruptible sleep
+            for _ in range(POLL_INTERVAL):
+                if _is_cancel_requested(scrape_run_id):
+                    _abort_apify_run(run_id)
+                    final_status = "ABORTED"
+                    break
+                time.sleep(1)
+
+            if final_status == "ABORTED":
+                break
+
+        # ── Final fetch to catch any remaining items ──────────────
         try:
-            items = _fetch_dataset(
+            all_items = _fetch_dataset(
                 dataset_id,
                 limit=len(batch) * max_posts_per_group * 2,
             )
+            remaining = all_items[last_saved_count:]
+            if remaining:
+                log(
+                    f"[Facebook Posts] Batch {b_idx + 1} final — "
+                    f"{len(remaining)} remaining post(s) saved"
+                )
+                _update_group_metadata(batch, remaining, log)
+                yield remaining
         except Exception as e:
-            log(
-                f"[Facebook Posts] Could not fetch dataset for "
-                f"batch {b_idx + 1}: {e}"
-            )
-            if status == "ABORTED":
-                return
-            continue
+            log(f"[Facebook Posts] Final fetch error for batch {b_idx + 1}: {e}")
 
-        log(
-            f"[Facebook Posts] Batch {b_idx + 1} — "
-            f"{len(items)} post(s) retrieved"
-        )
-
-        _update_group_metadata(batch, items, log)
-
-        if items:
-            yield items
-
-        if status == "ABORTED":
+        if final_status == "ABORTED":
             return
 
         if b_idx < total_batches - 1:

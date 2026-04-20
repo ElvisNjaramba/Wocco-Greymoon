@@ -100,7 +100,8 @@ def normalize_facebook(
     )
     group_url = (
         item.get("groupUrl") or item.get("group_url") or
-        item.get("groupLink") or ""
+        item.get("groupLink") or item.get("inputUrl") or   # ADD inputUrl
+        item.get("input_url") or ""
     )
 
     post_url = (
@@ -135,7 +136,7 @@ def normalize_facebook(
     resolved_zip = zip_code or _extract_zip_from_text(text) or ""
 
     normalized = {
-        "post_id":          post_id or _content_hash({"url": post_url, "text": text[:200]}),
+        "post_id": post_id or _content_hash({"url": post_url, "text": text[:200], "title": title}),
         "url":              post_url,
         "title":            title,
         "post":             text,
