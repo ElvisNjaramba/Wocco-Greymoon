@@ -1405,18 +1405,23 @@ const fetchNewLeadsOnly = useCallback(async () => {
 
 const exportRunLeads = useCallback(async (runId, e) => {
   e.stopPropagation();
-  const token = localStorage.getItem("token");
-  const res = await fetch(`${API}/scrape/runs/${runId}/export/`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) return;
-  const blob = await res.blob();
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement("a");
-  a.href = url;
-  a.download = `run_${runId.slice(0, 8)}_leads.xlsx`;
-  a.click();
-  URL.revokeObjectURL(url);
+  const token = localStorage.getItem("access");   // ← was "token", must be "access"
+  try {
+    const res = await fetch(`${API}/scrape/runs/${runId}/export/`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error("Export failed");
+    const blob    = await res.blob();
+    const link    = document.createElement("a");
+    link.href     = URL.createObjectURL(blob);
+    const cd      = res.headers.get("Content-Disposition") || "";
+    const fnMatch = cd.match(/filename="?([^"]+)"?/);
+    link.download = fnMatch ? fnMatch[1] : `run_${runId.slice(0, 8)}_leads.xlsx`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  } catch (e) {
+    alert("Export failed. Please try again.");
+  }
 }, []);
 
   const fetchFbGroupCount = useCallback(async () => { try { const r = await axios.get(`${API}/fb-groups/`, { headers }); setFbGroupCount((r.data.groups || []).length); } catch (_) {} }, [headers]);
