@@ -1,4 +1,5 @@
 import { createContext, useState, useEffect, useRef } from "react";
+import axios from "axios";
 import API from "../api/axios";
 
 export const AuthContext = createContext();
@@ -32,18 +33,22 @@ export const AuthProvider = ({ children }) => {
     refreshTimer.current = setTimeout(doRefresh, delay);
   };
 
-  const doRefresh = async () => {
-    const refresh = localStorage.getItem("refresh");
-    if (!refresh) return;
-    try {
-      const res = await API.post("token/refresh/", { refresh });
-      localStorage.setItem("access", res.data.access);
-      if (res.data.refresh) localStorage.setItem("refresh", res.data.refresh);
-      scheduleRefresh(res.data.access);
-    } catch {
-      logout();
-    }
-  };
+const doRefresh = async () => {
+  const refresh = localStorage.getItem("refresh");
+  if (!refresh) return;
+  try {
+    // Use raw axios to avoid the interceptor loop
+    const res = await axios.post(
+      "https://greymoonignorelistcom.dbm.shared-servers.com/api/token/refresh/",
+      { refresh }
+    );
+    localStorage.setItem("access", res.data.access);
+    if (res.data.refresh) localStorage.setItem("refresh", res.data.refresh);
+    scheduleRefresh(res.data.access);
+  } catch {
+    logout();
+  }
+};
 
   const getUser = async () => {
     const token = localStorage.getItem("access");

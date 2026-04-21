@@ -1,7 +1,9 @@
 import axios from "axios";
 
+const BASE_URL = "https://greymoonignorelistcom.dbm.shared-servers.com/api/";
+
 const API = axios.create({
-  baseURL: "https://greymoonignorelistcom.dbm.shared-servers.com/api/",
+  baseURL: BASE_URL,
 });
 
 API.interceptors.request.use(
@@ -16,6 +18,7 @@ API.interceptors.request.use(
 );
 
 let _refreshing = null;
+let _lastRefreshAt = 0;
 
 API.interceptors.response.use(
   response => response,
@@ -33,16 +36,24 @@ API.interceptors.response.use(
         return Promise.reject(error);
       }
 
-      // Prevent multiple simultaneous refresh calls
       if (!_refreshing) {
+        const now = Date.now();
+
+        // If we refreshed successfully in the last 5 seconds,
+        // just use the token already in storage — don't hit the server again
+        if (now - _lastRefreshAt < 5000) {
+          const freshAccess = localStorage.getItem("access");
+          if (freshAccess) {
+            original.headers.Authorization = `Bearer ${freshAccess}`;
+            return API(original);
+          }
+        }
+
         _refreshing = axios
-          .post(
-            "https://greymoonignorelistcom.dbm.shared-servers.com/api/token/refresh/",
-            { refresh }
-          )
+          .post(`${BASE_URL}token/refresh/`, { refresh })
           .then(res => {
+            _lastRefreshAt = Date.now();
             localStorage.setItem("access", res.data.access);
-            // If rotation is enabled, update refresh token too
             if (res.data.refresh) {
               localStorage.setItem("refresh", res.data.refresh);
             }

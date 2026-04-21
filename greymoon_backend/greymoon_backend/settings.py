@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-rpw3@rl9&_yf5c08%s+4(xakzv4qj$5wjl++x2v&wyl&)!u#n*'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = False
 
 ALLOWED_HOSTS = ["*"]
 
@@ -72,10 +72,10 @@ REST_FRAMEWORK = {
 }
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=30),
+    'ACCESS_TOKEN_LIFETIME':  timedelta(minutes=60),   # was 30 — give more runway
     'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
-    'ROTATE_REFRESH_TOKENS': True,
-    'BLACKLIST_AFTER_ROTATION': True,
+    'ROTATE_REFRESH_TOKENS':  False,   # ← disable rotation to kill the race
+    'BLACKLIST_AFTER_ROTATION': False, # ← no blacklist needed if not rotating
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
 
