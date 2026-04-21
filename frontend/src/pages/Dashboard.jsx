@@ -1275,9 +1275,11 @@ export default function Services() {
   const [selectedLead, setSelectedLead] = useState(null);
   const [loading, setLoading]           = useState(false);
   const [page, setPage]                 = useState(1);
-  const [historyPage, setHistoryPage]   = useState(1);
   const [activeTab, setActiveTab]       = useState("leads");
   const [suggestions, setSuggestions]   = useState({ list: [], show: false });
+  const [historyPage, setHistoryPage]   = useState(1);
+  const [expandedRunId, setExpandedRunId]   = useState(null);
+  const [runLeads, setRunLeads]             = useState({});
   const locationInputRef = useRef(null);
   const lastTypedRef     = useRef(0);
   const [fbViewMode, setFbViewMode]     = useState("cards");
@@ -1383,6 +1385,40 @@ const fetchNewLeadsOnly = useCallback(async () => {
   const fetchCategories = useCallback(async () => { try { const r = await axios.get(`${API}/meta/categories/`); setCategories(r.data.categories); } catch (_) {} }, []);
   const fetchCities     = useCallback(async () => { try { const r = await axios.get(`${API}/meta/cities/`, { headers }); setCities(r.data.cities); } catch (_) {} }, [headers]);
   const fetchHistory    = useCallback(async () => { try { const r = await axios.get(`${API}/scrape/history/`, { headers }); setHistory(r.data); } catch (_) {} }, [headers]);
+  const fetchRunLeads = useCallback(async (runId) => {
+  // Toggle collapse if already expanded
+  if (expandedRunId === runId) {
+    setExpandedRunId(null);
+    return;
+  }
+  setExpandedRunId(runId);
+  // If already loaded, just show it
+  if (runLeads[runId]) return;
+  setRunLeads(prev => ({ ...prev, [runId]: { leads: [], total: 0, loading: true } }));
+  try {
+    const r = await axios.get(`${API}/scrape/runs/${runId}/leads/`, { headers });
+    setRunLeads(prev => ({ ...prev, [runId]: { leads: r.data.results, total: r.data.total, loading: false } }));
+  } catch (_) {
+    setRunLeads(prev => ({ ...prev, [runId]: { leads: [], total: 0, loading: false } }));
+  }
+}, [expandedRunId, runLeads, headers]);
+
+const exportRunLeads = useCallback(async (runId, e) => {
+  e.stopPropagation();
+  const token = localStorage.getItem("token");
+  const res = await fetch(`${API}/scrape/runs/${runId}/export/`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) return;
+  const blob = await res.blob();
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url;
+  a.download = `run_${runId.slice(0, 8)}_leads.xlsx`;
+  a.click();
+  URL.revokeObjectURL(url);
+}, []);
+
   const fetchFbGroupCount = useCallback(async () => { try { const r = await axios.get(`${API}/fb-groups/`, { headers }); setFbGroupCount((r.data.groups || []).length); } catch (_) {} }, [headers]);
 const checkScrapeStatus = useCallback(async () => {
   try {
@@ -2228,55 +2264,138 @@ onBlur={e => setMaxPostsPerGroup(Math.max(5, Math.min(500, parseInt(e.target.val
               </div>
             )}
 
-            {activeTab === "history" && (
-              <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
-                <div className="px-5 py-4 border-b border-white/[0.06]"><span className="text-sm font-semibold">Scrape History</span></div>
-                {history.length === 0 ? <div className="py-16 text-center text-white/20 text-sm">No scrape runs yet</div> : (
-                  <div className="divide-y divide-white/[0.04]">
-                    {history.slice((historyPage - 1) * 10, historyPage * 10).map(run => (
-                      <div key={run.run_id} className="px-4 py-4 flex items-start justify-between gap-4 hover:bg-white/[0.02] transition-colors">
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2 flex-wrap mb-1">
-                            <span className={`inline-flex items-center gap-1 text-[10px] font-bold uppercase px-2 py-0.5 rounded border ${run.status === "SUCCEEDED" ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400" : run.status === "RUNNING" ? "bg-amber-500/10 border-amber-500/20 text-amber-400" : run.status === "PARTIAL" ? "bg-yellow-500/10 border-yellow-500/20 text-yellow-400" : "bg-red-500/10 border-red-500/20 text-red-400"}`}>
-                              {run.status === "RUNNING" && <Loader className="w-2.5 h-2.5 animate-spin" />}{run.status}
-                            </span>
-                            <span className="text-xs text-white/60 font-medium">{run.location || "---"}</span>
-                          </div>
-                          <div className="flex items-center gap-2 text-[11px] text-white/25 flex-wrap">
-                            <span>{run.categories?.join(", ") || "---"}</span><span>·</span>
-                            <span>{run.sources?.join(", ") || "---"}</span><span>·</span>
-                            <span>{new Date(run.started_at).toLocaleString()}</span>
-                          </div>
-                          {run.source_stats && Object.keys(run.source_stats).length > 0 && (
-                            <div className="flex items-center gap-2 mt-1.5 flex-wrap">
-                              {Object.entries(run.source_stats).map(([src, s]) => {
-                                const cfg = SOURCE_CFG[src.toUpperCase()];
-                                if (!cfg || !s.saved) return null;
-                                return (
-                                  <span key={src} className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${cfg.badge}`}>
-                                    {cfg.label} {s.saved}
-                                  </span>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </div>
-                        <div className="text-right flex-shrink-0">
-                          <div className="text-lg font-bold tabular-nums">{run.leads_collected}</div>
-                          <div className="text-[10px] text-white/25">leads</div>
-                          {run.leads_skipped > 0 && <div className="text-[10px] text-white/20">{run.leads_skipped} skipped</div>}
-                        </div>
-                      </div>
-                    ))}
+{activeTab === "history" && (
+  <div className="bg-white/[0.03] border border-white/[0.06] rounded-2xl overflow-hidden">
+    <div className="px-5 py-4 border-b border-white/[0.06]">
+      <span className="text-sm font-semibold">Scrape History</span>
+    </div>
+    {history.length === 0 ? (
+      <div className="py-16 text-center text-white/20 text-sm">No scrape runs yet</div>
+    ) : (
+      <div className="divide-y divide-white/[0.04]">
+        {history.slice((historyPage - 1) * 10, historyPage * 10).map(run => {
+          const isExpanded = expandedRunId === run.run_id;
+          const runData    = runLeads[run.run_id];
+          return (
+            <div key={run.run_id}>
+              {/* ── Run row (clickable) ── */}
+              <div
+                className="px-4 py-4 flex items-start justify-between gap-4 hover:bg-white/[0.02] transition-colors cursor-pointer"
+                onClick={() => fetchRunLeads(run.run_id)}
+              >
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap mb-1">
+                    <span className={`inline-flex items-center gap-1 text-[10px] font-bold uppercase px-2 py-0.5 rounded border ${
+                      run.status === "SUCCEEDED" ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400" :
+                      run.status === "RUNNING"   ? "bg-amber-500/10 border-amber-500/20 text-amber-400" :
+                      run.status === "PARTIAL"   ? "bg-yellow-500/10 border-yellow-500/20 text-yellow-400" :
+                                                   "bg-red-500/10 border-red-500/20 text-red-400"
+                    }`}>
+                      {run.status === "RUNNING" && <Loader className="w-2.5 h-2.5 animate-spin" />}
+                      {run.status}
+                    </span>
+                    <span className="text-xs text-white/60 font-medium">{run.location || "---"}</span>
+                    {/* Expand chevron */}
+                    {isExpanded
+                      ? <ChevronUp   className="w-3.5 h-3.5 text-white/30 ml-auto" />
+                      : <ChevronDown className="w-3.5 h-3.5 text-white/30 ml-auto" />
+                    }
                   </div>
-                )}
-                {history.length > 10 && (
-                  <div className="px-5 py-3 border-t border-white/[0.06] flex justify-center gap-2 flex-wrap">
-                    {Array.from({ length: Math.ceil(history.length / 10) }, (_, i) => <button key={i} onClick={() => setHistoryPage(i + 1)} className={`px-3 py-1.5 rounded-lg text-xs transition-colors ${historyPage === i + 1 ? "bg-blue-600 text-white" : "bg-white/5 text-white/30 hover:text-white"}`}>{i + 1}</button>)}
+                  <div className="flex items-center gap-2 text-[11px] text-white/25 flex-wrap">
+                    <span>{run.categories?.join(", ") || "---"}</span><span>·</span>
+                    <span>{run.sources?.join(", ")    || "---"}</span><span>·</span>
+                    <span>{new Date(run.started_at).toLocaleString()}</span>
                   </div>
-                )}
+                  {run.source_stats && Object.keys(run.source_stats).length > 0 && (
+                    <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                      {Object.entries(run.source_stats).map(([src, s]) => {
+                        const cfg = SOURCE_CFG[src.toUpperCase()];
+                        if (!cfg || !s.saved) return null;
+                        return (
+                          <span key={src} className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${cfg.badge}`}>
+                            {cfg.label} {s.saved}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+                <div className="text-right flex-shrink-0 flex flex-col items-end gap-1.5">
+                  <div>
+                    <div className="text-lg font-bold tabular-nums">{run.leads_collected}</div>
+                    <div className="text-[10px] text-white/25">leads</div>
+                    {run.leads_skipped > 0 && <div className="text-[10px] text-white/20">{run.leads_skipped} skipped</div>}
+                  </div>
+                  {/* Export button */}
+                  {run.leads_collected > 0 && (
+                    <button
+                      onClick={(e) => exportRunLeads(run.run_id, e)}
+                      className="flex items-center gap-1 text-[10px] font-semibold px-2.5 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/25 text-emerald-400 hover:bg-emerald-500/20 transition-all"
+                    >
+                      <Download className="w-3 h-3" /> Export
+                    </button>
+                  )}
+                </div>
               </div>
-            )}
+
+              {/* ── Expanded leads panel ── */}
+              {isExpanded && (
+                <div className="bg-black/20 border-t border-white/[0.04] px-4 py-3">
+                  {!runData || runData.loading ? (
+                    <div className="py-6 flex items-center justify-center gap-2 text-white/25 text-xs">
+                      <Loader className="w-4 h-4 animate-spin" /> Loading leads...
+                    </div>
+                  ) : runData.leads.length === 0 ? (
+                    <div className="py-6 text-center text-white/20 text-xs">No leads found for this run</div>
+                  ) : (
+                    <>
+                      <div className="flex items-center justify-between mb-3">
+                        <span className="text-[11px] text-white/40 font-semibold">{runData.total} lead{runData.total !== 1 ? "s" : ""} from this run</span>
+                      </div>
+                      <div className="divide-y divide-white/[0.04] max-h-[360px] overflow-y-auto rounded-xl border border-white/[0.06] bg-white/[0.02]">
+                        {runData.leads.map(lead => (
+                          <div
+                            key={lead.post_id}
+                            className="px-3 py-2.5 flex items-start gap-3 hover:bg-white/[0.02] cursor-pointer transition-colors"
+                            onClick={() => setSelectedLead(lead)}
+                          >
+                            <SourceTag source={lead.source} />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-xs font-medium text-white/75 truncate">{lead.title}</p>
+                              <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                                {lead.location && <span className="text-[10px] text-white/30 flex items-center gap-0.5"><MapPin className="w-2.5 h-2.5" />{lead.location}</span>}
+                                {lead.phone    && <span className="text-[10px] text-emerald-400/80 flex items-center gap-0.5"><Phone className="w-2.5 h-2.5" />{lead.phone}</span>}
+                                {lead.email    && <span className="text-[10px] text-violet-400/70 flex items-center gap-0.5"><Mail className="w-2.5 h-2.5" />{lead.email}</span>}
+                              </div>
+                            </div>
+                            <ScoreDot score={lead.score} />
+                          </div>
+                        ))}
+                      </div>
+                      {runData.total > runData.leads.length && (
+                        <p className="text-center text-[10px] text-white/20 mt-2">Showing first {runData.leads.length} of {runData.total} leads. Export for full list.</p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    )}
+    {history.length > 10 && (
+      <div className="px-5 py-3 border-t border-white/[0.06] flex justify-center gap-2 flex-wrap">
+        {Array.from({ length: Math.ceil(history.length / 10) }, (_, i) => (
+          <button key={i} onClick={() => setHistoryPage(i + 1)}
+            className={`px-3 py-1.5 rounded-lg text-xs transition-colors ${historyPage === i + 1 ? "bg-blue-600 text-white" : "bg-white/5 text-white/30 hover:text-white"}`}>
+            {i + 1}
+          </button>
+        ))}
+      </div>
+    )}
+  </div>
+)}
           </>)}
         </main>
       </div>

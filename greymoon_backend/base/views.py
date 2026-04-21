@@ -375,6 +375,136 @@ def scrape_history(request):
     ])
 
 
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def run_leads(request, run_id):
+    """Return all leads generated during a specific scrape run."""
+    run = ScrapeRun.objects.filter(run_id=run_id).first()
+    if not run:
+        return Response({"error": "Run not found"}, status=404)
+
+    # Leads created during this run's time window, attributed to this run
+    leads = ServiceLead.objects.filter(
+        created_at__gte=run.created_at,
+        created_at__lte=(run.finished_at or datetime.now(timezone.utc)),
+    ).order_by("-score", "-created_at")
+
+    serializer = ServiceLeadSerializer(leads, many=True)
+    return Response({
+        "results": serializer.data,
+        "total": leads.count(),
+        "run_id": run_id,
+        "location": run.location_display,
+        "started_at": run.created_at,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def export_run_leads(request, run_id):
+    """Export all leads from a specific scrape run as Excel."""
+    run = ScrapeRun.objects.filter(run_id=run_id).first()
+    if not run:
+        return Response({"error": "Run not found"}, status=404)
+
+    leads = ServiceLead.objects.filter(
+        created_at__gte=run.created_at,
+        created_at__lte=(run.finished_at or datetime.now(timezone.utc)),
+    ).order_by("-score", "-created_at")
+
+    # Reuse exact same Excel builder as export_leads —
+    # patch request.query_params to be empty so no extra filters apply
+    # The simplest approach is to inline the workbook build here:
+    from django.utils import timezone as tz
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Run Leads"
+
+    HEADER_BG = "1E293B"; HEADER_FG = "F8FAFC"
+    CL_BG = "FFF7ED"; FB_BG = "EEF2FF"; GG_BG = "F0F9FF"; ALT_BG = "F8FAFC"
+    HIGH_SCORE = "D1FAE5"; MED_SCORE = "FEF9C3"; BORDER_CLR = "E2E8F0"
+    SOURCE_BG = {"CRAIGSLIST": CL_BG, "FACEBOOK": FB_BG, "GOOGLE": GG_BG}
+    SOURCE_LABEL = {"CRAIGSLIST": "CL", "FACEBOOK": "FB", "GOOGLE": "GG"}
+
+    def thin_border():
+        s = Side(style="thin", color=BORDER_CLR)
+        return Border(left=s, right=s, top=s, bottom=s)
+    def header_font(): return Font(name="Arial", bold=True, color=HEADER_FG, size=9)
+    def cell_font(bold=False, color="1E293B", size=9): return Font(name="Arial", bold=bold, color=color, size=size)
+    def fill(hex_color): return PatternFill("solid", fgColor=hex_color)
+    def center(): return Alignment(horizontal="center", vertical="center", wrap_text=False)
+    def left(): return Alignment(horizontal="left", vertical="center", wrap_text=False)
+
+    COLS = [
+        ("Source","source",8,"center"),("Score","score",7,"center"),("Status","status",11,"center"),
+        ("Title","title",42,"left"),("Phone","phone",16,"left"),("Email","email",28,"left"),
+        ("Location","location",20,"left"),("State","state",8,"center"),
+        ("Category","service_category",18,"left"),("FB Group","fb_group_name",24,"left"),
+        ("URL","url",40,"left"),("Posted","datetime",14,"center"),("Scraped","created_at",14,"center"),
+    ]
+
+    ws.row_dimensions[1].height = 20
+    for col_idx, (header, _, width, align) in enumerate(COLS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = header_font(); cell.fill = fill(HEADER_BG)
+        cell.alignment = center() if align == "center" else left()
+        cell.border = thin_border()
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+    ws.freeze_panes = "A2"
+
+    for row_idx, lead in enumerate(leads, start=2):
+        ws.row_dimensions[row_idx].height = 16
+        src = (lead.source or "").upper()
+        row_bg = SOURCE_BG.get(src, ALT_BG if row_idx % 2 == 0 else "FFFFFF")
+        for col_idx, (_, field, _, align) in enumerate(COLS, start=1):
+            if field == "source": value = SOURCE_LABEL.get(src, src)
+            elif field == "score": value = lead.score
+            elif field == "status": value = lead.status
+            elif field == "title": value = (lead.title or "")[:200]
+            elif field == "phone": value = lead.phone or ""
+            elif field == "email": value = lead.email or ""
+            elif field == "location": value = lead.location or ""
+            elif field == "state": value = lead.state or ""
+            elif field == "service_category": value = lead.service_category or lead.category or ""
+            elif field == "fb_group_name": value = lead.fb_group_name or ""
+            elif field == "url": value = lead.url or ""
+            elif field == "datetime": value = lead.datetime.strftime("%Y-%m-%d") if lead.datetime else ""
+            elif field == "created_at": value = lead.created_at.strftime("%Y-%m-%d") if lead.created_at else ""
+            else: value = ""
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.border = thin_border()
+            cell.alignment = center() if align == "center" else left()
+            if field == "score":
+                score_val = lead.score or 0
+                if score_val >= 70: cell.fill = fill(HIGH_SCORE); cell.font = cell_font(bold=True, color="065F46")
+                elif score_val >= 40: cell.fill = fill(MED_SCORE); cell.font = cell_font(bold=True, color="92400E")
+                else: cell.fill = fill(row_bg); cell.font = cell_font(color="64748B")
+            elif field == "url" and lead.url:
+                cell.fill = fill(row_bg); cell.font = Font(name="Arial", size=9, color="2563EB", underline="single")
+                cell.hyperlink = lead.url
+            else:
+                cell.fill = fill(row_bg)
+                cell.font = cell_font(bold=(field == "title"), color="1E293B" if field == "title" else "475569")
+
+    total_rows = leads.count()
+    sr = total_rows + 3
+    ws.cell(row=sr, column=1, value="Run:").font = cell_font(bold=True)
+    ws.cell(row=sr, column=2, value=run.location_display).font = cell_font()
+    ws.cell(row=sr+1, column=1, value="Total leads:").font = cell_font(bold=True)
+    ws.cell(row=sr+1, column=2, value=total_rows).font = cell_font(bold=True)
+    ws.cell(row=sr+2, column=1, value="Exported at:").font = cell_font(bold=True)
+    ws.cell(row=sr+2, column=2, value=tz.now().strftime("%Y-%m-%d %H:%M UTC")).font = cell_font()
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(COLS))}1"
+
+    buffer = io.BytesIO()
+    wb.save(buffer); buffer.seek(0)
+    slug = run.location_display.replace(" ", "_")[:30] if run.location_display else run_id[:8]
+    filename = f"run_{slug}_{tz.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    response = HttpResponse(buffer.read(), content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def add_fb_groups(request):

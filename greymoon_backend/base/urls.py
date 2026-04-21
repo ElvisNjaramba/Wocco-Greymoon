@@ -4,7 +4,7 @@ from .views import (
     list_services, update_lead_status,
     get_cities, get_categories,
     list_scraped_groups, list_group_leads, delete_scraped_group,
-    add_fb_groups, scrape_selected_groups, export_leads
+    add_fb_groups, scrape_selected_groups, export_leads, run_leads, export_run_leads,
 )
 
 urlpatterns = [
@@ -25,4 +25,7 @@ urlpatterns = [
 
     path("meta/cities/",     get_cities,     name="get_cities"),
     path("meta/categories/", get_categories, name="get_categories"),
+
+    path("scrape/runs/<str:run_id>/leads/",        run_leads,        name="run_leads"),
+    path("scrape/runs/<str:run_id>/export/",       export_run_leads, name="export_run_leads"),
 ]
